@@ -101,6 +101,20 @@ the fourth field (the start time) in place."
          (concat "\\1" (format "%g" value))
          bol eol)))))
 
+(defun csound--get-advance-start ()
+  "Return the 4th column value of the advance statement as a float.
+Returns 0.0 if the line cannot be found or is malformed."
+  (save-mark-and-excursion
+    (goto-char (point-min))
+    (if (search-forward "advance statement" nil t)
+        (progn
+          (forward-line 1)
+          (let ((cols (split-string (thing-at-point 'line t) "[ \t]+" t)))
+            (if (>= (length cols) 4)
+                (string-to-number (nth 3 cols))
+              0.0)))
+      0.0)))
+
 (defun play-from-cursor ()
   (interactive)
   ;; csound--get-number-at-column resolves ++N / +-N as well
@@ -168,9 +182,9 @@ the fourth field (the start time) in place."
       (csound-stop)
     (kill-process "csound"))
   (if csound-start-time
-      (let* ((stop-time       (float-time))
-             (elapsed-seconds (- stop-time csound-start-time))
-             (start-offset    (if (boundp 'a) (or a 0) 0))
+      (let* ((stop-time        (float-time))
+             (elapsed-seconds  (- stop-time csound-start-time))
+             (start-offset     (csound--get-advance-start))
              (total-score-time (+ start-offset elapsed-seconds)))
         (message "Stopped at score time: %.2f seconds (Offset: %.2f + Elapsed: %.2f)"
                  total-score-time start-offset elapsed-seconds)
@@ -647,7 +661,7 @@ Only i-statements for instruments other than 1 are harvested."
   (dolist (cell my-column-decimal-cycles)
     (setcdr cell (sort (cdr cell) 'string-lessp)))
   (message "Harvest Complete: Full fields and Decimals stored."))
-;; 4. FIELD CYCLING (# and *)
+;; 4. FIELD CYCLING
 (defun cycle-current-field (direction)
   "Cycles the whole field at point."
   (interactive "p")
@@ -679,7 +693,7 @@ Only i-statements for instruments other than 1 are harvested."
                   (setq start (match-end 0) count (1+ count))))
               (when rbeg (delete-region rbeg rend) (goto-char rbeg) (insert new-val)
                     (when (fboundp 'csound-score-align) (csound-score-align))))))))))
-;; 5. DECIMAL CYCLING (C-# and C-*)
+;; 5. DECIMAL CYCLING
 (defun cycle-decimal-part (direction)
   "Cycles only the decimal part of the value at point."
   (interactive "p")
@@ -803,17 +817,15 @@ Typical keymap usage:
     (goto-char cursor-marker)
     (set-marker cursor-marker nil)))
 
-(global-set-key (kbd "%") 'csound-mode)
-
 (define-minor-mode csound-mode
   " compoooosing "
   nil ; INITIAL VALUE
   " csound" ; INDICATOR
   :keymap (let ((map (make-sparse-keymap)))
+            ;; ref. of the Engram layout with numeric layer activated
 			;; > b y o u ' ( d n g v q
 			;; 0 1 2 3 4 , . 5 6 7 8 9
 			;; ~ ^ # * & - ? @ = + $ /
-			;; TODO: a shortcut to toggle between csound-mode for typing comments!
 			(define-key map (kbd "&") (lambda () (interactive) (csound-cycle-column 2  1 0))) ; p3 forward full
 			(define-key map (kbd "*") (lambda () (interactive) (csound-cycle-column 2 -1 0))) ; p3 backward full
 			(define-key map (kbd "@") (lambda () (interactive) (csound-cycle-column 4  1 1))) ; p5 forward decimal
@@ -851,6 +863,8 @@ Typical keymap usage:
       (modify-syntax-entry ?\. "." (syntax-table))
 	  (visual-line-mode 1)
 	  (setq truncate-lines nil))))
+
+(global-set-key (kbd "%") 'csound-mode) ; global shortcut as we need to return from text-mode
 
 (add-hook 'fundamental-mode-hook 'csound-mode) ; ASSOCIATE MAJOR MODE WITH A MINOR MODE
 
