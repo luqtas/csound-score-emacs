@@ -26,6 +26,9 @@ With a prefix argument SHOW-BUFFER (e.g., C-u), display the output window."
      (t
       (when (buffer-modified-p)
         (save-buffer))
+
+      (csound-stop)
+
       (let* ((buf-name "*Csound Output*")
              (proc (start-process "csound-process" buf-name "csound" "-odac" file-path)))
         (message "Csound started for %s..." (file-name-nondirectory file-path))
@@ -43,8 +46,16 @@ With a prefix argument SHOW-BUFFER (e.g., C-u), display the output window."
 ;; numbers before Csound ever sees the score.  The original .sco buffer is
 ;; never touched by this process.
 
+(defun csound-stop ()
+  (interactive)
+  ;; Changed '0' to 'nil' so Emacs runs this synchronously.
+  ;; This prevents 'killall' from accidentally sniping the new process.
+  (call-process "killall" nil nil nil "csound")
+  (csound--cleanup-tempfile))
+
 (defun csound-start ()
   (interactive)
+  (csound-stop) ;; Snuff out the old instance
   (save-buffer)
   (let ((score-file (csound--create-resolved-tempfile)))
     (call-process "csound" nil 0 nil
@@ -56,16 +67,17 @@ With a prefix argument SHOW-BUFFER (e.g., C-u), display the output window."
 
 (defun csound-record-wav ()
   (interactive)
+  (csound-stop) ;; Snuff out the old instance
   (save-buffer)
   (let ((score-file (csound--create-resolved-tempfile)))
     (call-process "csound" nil 0 nil
                   "-o" (file-name-with-extension buffer-file-name ".wav")
                   "/home/luqtas/Desktop/projects/qob/Csound/header.orc"
                   score-file "-W")))
-; -o noise.wav -W ; for file output any platform
 
 (defun csound-record-ogg ()
   (interactive)
+  (csound-stop) ;; Snuff out the old instance
   (save-buffer)
   (let ((score-file (csound--create-resolved-tempfile)))
     (call-process "csound" nil 0 nil
@@ -73,12 +85,30 @@ With a prefix argument SHOW-BUFFER (e.g., C-u), display the output window."
                   "--ogg"
                   "/home/luqtas/Desktop/projects/qob/Csound/header.orc"
                   score-file)))
-; -o noise.ogg --ogg
 
-(defun csound-stop ()
+(defun csound-show-macro-values ()
+  "Print the resolved numeric values of any macros on the current line."
   (interactive)
-  (call-process "killall" nil 0 nil "csound")
-  (csound--cleanup-tempfile))
+  (let ((col-idx 0)
+        (code-end (csound--code-end-position))
+        (results '()))
+    (save-excursion
+      (beginning-of-line)
+      ;; Step through every p-field on the line
+      (while (re-search-forward csound-number-regex code-end t)
+        (setq col-idx (1+ col-idx))
+        (let ((val-str (match-string 0)))
+          ;; If it's a macro, resolve it and store the string
+          (when (csound-is-macro-p val-str)
+            (push (format "p%d[%s] = %g"
+                          col-idx
+                          val-str
+                          (csound--get-number-at-column col-idx))
+                  results)))))
+    ;; Display the results
+    (if results
+        (message "Macros: %s" (mapconcat #'identity (nreverse results) "  |  "))
+      (message "No macros found on the current line."))))
 
 ;; CUSTOM PLAY FUNCTIONS ;;
 (defun log-csound-start ()
@@ -188,6 +218,33 @@ Returns 0.0 if the line cannot be found or is malformed."
              (total-score-time (+ start-offset elapsed-seconds)))
         (message "Stopped at score time: %.2f seconds (Offset: %.2f + Elapsed: %.2f)"
                  total-score-time start-offset elapsed-seconds)
+        (setq csound-start-time nil))
+    (message "Csound stopped. No active timer to reset.")))
+
+(defun csound-stop-and-track ()
+  "Stops the Csound process, calculates elapsed time, and moves to the playing note."
+  (interactive)
+  (if (fboundp 'csound-stop)
+      (csound-stop)
+    (kill-process "csound"))
+
+  (if csound-start-time
+      (let* ((stop-time        (float-time))
+             (elapsed-seconds  (- stop-time csound-start-time))
+             (start-offset     (csound--get-advance-start))
+             (total-score-time (+ start-offset elapsed-seconds))
+             (saved-col        (current-column)))
+
+        ;; Hunt for the note in the current paragraph
+        (let ((target-pos (csound--find-stop-line total-score-time)))
+          (if target-pos
+              (progn
+                ;; Jump to the line and restore horizontal placement
+                (goto-char target-pos)
+                (move-to-column saved-col)
+                (message "Stopped at %.2fs. Jumped to active note." total-score-time))
+            (message "Stopped at %.2fs. No matching notes in paragraph." total-score-time)))
+
         (setq csound-start-time nil))
     (message "Csound stopped. No active timer to reset.")))
 
@@ -348,6 +405,44 @@ their RESOLVED value is still used as the base for the lines that follow."
     (csound-score-align)))
 
 ;; --- Required Helpers ---
+
+(defun csound--find-stop-line (stop-time)
+  "Finds the best matching note line in the current paragraph for STOP-TIME.
+Returns the buffer position of the line, or nil if none match."
+  (let ((para-beg (save-excursion (backward-paragraph) (point)))
+        (para-end (save-excursion (forward-paragraph) (point)))
+        (best-inside nil)
+        (best-fallback nil)
+        (max-end -1.0))
+    (save-excursion
+      (goto-char para-beg)
+      (while (< (point) para-end)
+        (let* ((line (buffer-substring-no-properties (line-beginning-position) (line-end-position)))
+               (trimmed (string-trim line)))
+          ;; Only parse active i-statements
+          (when (and (not (string-empty-p trimmed))
+                     (not (string-prefix-p ";" trimmed))
+                     (string-match-p "^[iI]" trimmed))
+            (let* ((p2 (csound--get-number-at-column 2))
+                   (p3 (csound--get-number-at-column 3))
+                   (end (+ p2 p3)))
+              ;; Only consider notes that have started before or right at the stop-time
+              (when (<= p2 stop-time)
+
+                ;; 1. The Active Match: stop-time falls inside this note's duration
+                ;; (We use > instead of >= so if a note ended EXACTLY when you stopped,
+                ;; it prioritizes the note starting on that exact second instead).
+                (when (> end stop-time)
+                  (unless best-inside
+                    (setq best-inside (line-beginning-position)))) ;; Keep the FIRST one we find
+
+                ;; 2. The Fallback Match: the note that ended closest to the stop-time
+                (when (>= end max-end)
+                  (setq max-end end)
+                  (setq best-fallback (line-beginning-position)))))))
+        (forward-line 1)))
+    ;; Return the active note if we found one; otherwise, return the best fallback
+    (or best-inside best-fallback)))
 
 (defun csound--code-end-position ()
   "Return the buffer position of the first ';' on the line, or `line-end-position` if none."
@@ -723,7 +818,57 @@ Only i-statements for instruments other than 1 are harvested."
               (when (fboundp 'csound-score-align) (csound-score-align))))
         (message "No decimal list for this column or not on a number.")))))
 
-;; 6. PINNED-COLUMN CYCLING
+;; 6. P-FIELD NAVIGATION (TAB / SHIFT-TAB)
+(defun csound-score-goto-field (direction)
+  "Move cursor to the end of the next (DIRECTION = +1) or previous
+(DIRECTION = -1) p-field on the current line.
+
+Tokens are collected up to the first ';' so inline comments are
+ignored.  Any value — numbers, symbols (. ^ +), macros (^+N +-N),
+or bracket expressions ([...]) — counts as a field.
+
+When the cursor sits inside field N, TAB lands at the end of field
+N+1; Shift-TAB lands at the end of field N-1.  Both directions clamp
+at the first / last field instead of wrapping."
+  (let* ((line-beg  (line-beginning-position))
+         (code-end  (csound--code-end-position)) ; stops before ';'
+         (line-text (buffer-substring-no-properties line-beg code-end))
+         (fields    nil)   ; list of (buf-beg . buf-end) for each token
+         (scan      0))
+    ;; Collect every token span in buffer coordinates.
+    (while (string-match "\\[[^]]+\\]\\|\\S-+" line-text scan)
+      (push (cons (+ line-beg (match-beginning 0))
+                  (+ line-beg (match-end       0)))
+            fields)
+      (setq scan (match-end 0)))
+    (setq fields (nreverse fields))
+    (when fields
+      (let* ((pos     (point))
+             (n       (length fields))
+             ;; cur-idx: the index of the field that contains point.
+             ;; Falls back to the last field whose end is <= point,
+             ;; which handles "cursor is between tokens" naturally.
+             ;; Stays -1 only when point is before every token.
+             (cur-idx -1))
+        (cl-loop for span in fields
+                 for i   from 0
+                 ;; "inside or at the very end of" this token
+                 when (and (>= pos (car span)) (<= pos (cdr span)))
+                 do (setq cur-idx i))
+        (when (= cur-idx -1)
+          ;; Point is not inside any token — find the last token that
+          ;; ends at or before point (i.e. cursor is in whitespace
+          ;; after that token).
+          (cl-loop for span in fields
+                   for i   from 0
+                   when (<= (cdr span) pos)
+                   do (setq cur-idx i)))
+        ;; Compute the target index, clamping at boundaries.
+        (let* ((new-idx (+ cur-idx direction))
+               (clamped (max 0 (min (1- n) new-idx))))
+          (goto-char (cdr (nth clamped fields))))))))
+
+;; 7. PINNED-COLUMN CYCLING
 (defun csound-cycle-column (col-idx direction decimal-only)
   "Cycle a fixed p-field column regardless of where the cursor is.
 
@@ -817,62 +962,143 @@ Typical keymap usage:
     (goto-char cursor-marker)
     (set-marker cursor-marker nil)))
 
+(defvar csound-active-layout 'engram
+  "The current manual keyboard layout for csound-mode ('engram or 'qwerty).")
+
+;; --- ENGRAM LAYER ---
+(defvar csound-engram-map
+  (let ((map (make-sparse-keymap)))
+    ;; general shortcuts ;;
+    (define-key map (kbd "o") #'csound-start)
+    (define-key map (kbd "O") #'csound-stop-and-log)
+    (define-key map (kbd "M-o") #'csound-stop-and-track)
+    (define-key map (kbd "N w") #'csound-record-wav)
+    (define-key map (kbd "N o") #'csound-record-ogg)
+    (define-key map (kbd "q") #'csound-header-edit)
+    (define-key map (kbd "d") #'duplicate-line)
+    (define-key map (kbd "g") #'csound-smart-duplicate)
+    (define-key map (kbd "G") #'csound-custom-duplicate)
+    (define-key map (kbd "C-G") #'csound-custom-duplicate-repeat)
+    (define-key map (kbd "y") #'play-from-value)
+    (define-key map (kbd "Y") #'which-play-value-show)
+    (define-key map (kbd "v") #'which-play-value-modify)
+    (define-key map (kbd "b") #'play-from-zero)
+    (define-key map (kbd "u") (lambda () (interactive) (insert "1.02197503906")))
+
+    ;; p-field cycle ;;
+    (define-key map (kbd "&") (lambda () (interactive) (csound-cycle-column 2  1 0)))
+    (define-key map (kbd "*") (lambda () (interactive) (csound-cycle-column 2 -1 0)))
+    (define-key map (kbd "@") (lambda () (interactive) (csound-cycle-column 4  1 1)))
+    (define-key map (kbd "=") (lambda () (interactive) (csound-cycle-column 4 -1 1)))
+    map)
+  "Engram-specific shortcuts for csound-mode.")
+
+;; --- QWERTY LAYER ---
+(defvar csound-qwerty-map
+  (let ((map (make-sparse-keymap)))
+    ;; general shortcuts ;;
+    (define-key map (kbd "f") #'csound-start)
+    (define-key map (kbd "F") #'csound-stop-and-log)
+    (define-key map (kbd "M-f") #'csound-stop-and-track)
+    (define-key map (kbd "C-c f w") #'csound-record-wav)
+    (define-key map (kbd "C-c f o") #'csound-record-ogg)
+    (define-key map (kbd "d") #'duplicate-line)
+    (define-key map (kbd "s") #'csound-smart-duplicate)
+    (define-key map (kbd "S") #'csound-custom-duplicate)
+    (define-key map (kbd "C-S") #'csound-custom-duplicate-repeat)
+    (define-key map (kbd "r") #'play-from-value)
+    (define-key map (kbd "e") #'which-play-value-modify)
+    (define-key map (kbd "E") #'which-play-value-show)
+    (define-key map (kbd "M-e") #'csound-show-macro-values)
+    (define-key map (kbd "w") #'play-from-zero)
+    (define-key map (kbd "Q") #'csound-header-edit)
+    (define-key map (kbd "A") (lambda () (interactive) (insert "1.02197503906")))
+
+    ;; p-fields cycle ;;
+    (define-key map (kbd "t") (lambda () (interactive) (csound-cycle-column 2  1 0))) ; dur p-field
+    (define-key map (kbd "y") (lambda () (interactive) (csound-cycle-column 2 -1 0)))
+    (define-key map (kbd "g") (lambda () (interactive) (csound-cycle-column 3  1 0))) ; amp p-field
+    (define-key map (kbd "h") (lambda () (interactive) (csound-cycle-column 3 -1 0)))
+    (define-key map (kbd "b") (lambda () (interactive) (csound-cycle-column 4  1 1))) ; note p-field
+    (define-key map (kbd "n") (lambda () (interactive) (csound-cycle-column 4 -1 1)))
+    (define-key map (kbd "u") (lambda () (interactive) (csound-cycle-column 5  1 0))) ; p6
+    (define-key map (kbd "i") (lambda () (interactive) (csound-cycle-column 5 -1 0)))
+    (define-key map (kbd "j") (lambda () (interactive) (csound-cycle-column 6  1 0))) ; p7
+    (define-key map (kbd "k") (lambda () (interactive) (csound-cycle-column 6 -1 0)))
+    (define-key map (kbd "m") (lambda () (interactive) (csound-cycle-column 7  1 0))) ; p8
+    (define-key map (kbd ",") (lambda () (interactive) (csound-cycle-column 7 -1 0)))
+    (define-key map (kbd "o") (lambda () (interactive) (csound-cycle-column 8  1 0))) ; p9
+	(define-key map (kbd "p") (lambda () (interactive) (csound-cycle-column 8 -1 0)))
+    (define-key map (kbd "l") (lambda () (interactive) (csound-cycle-column 9  1 0))) ; p10
+	(define-key map (kbd ";") (lambda () (interactive) (csound-cycle-column 9 -1 0)))
+    (define-key map (kbd "[") (lambda () (interactive) (csound-cycle-column 10	1 0))) ; p11
+	(define-key map (kbd "]") (lambda () (interactive) (csound-cycle-column 10 -1 0)))
+    (define-key map (kbd "'") (lambda () (interactive) (csound-cycle-column 11	1 0))) ; p12
+	(define-key map (kbd "\\") (lambda () (interactive) (csound-cycle-column 11 -1 0)))
+    map)
+  "QWERTY-specific shortcuts for csound-mode.")
+
+;; --- BASE MAP ---
+(defvar csound-mode-map
+  (let ((map (make-sparse-keymap)))
+    ;; Layout-Agnostic Shortcuts (Same on both layouts)
+    (define-key map (kbd "<TAB>")     (lambda () (interactive) (csound-score-goto-field  1)))
+    (define-key map (kbd "<backtab>") (lambda () (interactive) (csound-score-goto-field -1)))
+    (define-key map (kbd "M-<tab>")   #'csound-score-align)
+    (define-key map (kbd "C-<iso-lefttab>") 'csound-recalculate-starts)
+
+    ;; Instruments shortcuts
+    (define-key map (kbd "C-c r") (lambda () (interactive) (insert "; bf0000's keyboard\n\n;12 STR DUR AMP NOTE KC1 KC2 VDEPTH STR VRATE END EDO REPEAT BASE")))
+    (define-key map (kbd "C-c g") (lambda () (interactive) (insert "; 00b100's lyre\n\n;9 STR DUR AMP NOTE PLK PICK REFL EDO REPEAT BASE")))
+    (define-key map (kbd "C-c b") (lambda () (interactive) (insert "; 3044eb's violin\n\n;11 STR DUR AMP NOTE PRES RAT STR VIBF END VAMP EDO REPEAT BASE")))
+    (define-key map (kbd "C-c y") (lambda () (interactive) (insert "; 9e9b00's vibraphone\n\n;10 STR DUR AMP NOTE HRD POS STR VIBF END EDO REPEAT BASE")))
+
+    ;; Set the initial parent to Engram
+    (set-keymap-parent map csound-engram-map)
+    map)
+  "Base keymap for csound-mode. Inherits from active layout.")
+
+;; --- MINOR MODE ---
 (define-minor-mode csound-mode
   " compoooosing "
-  nil ; INITIAL VALUE
-  " csound" ; INDICATOR
-  :keymap (let ((map (make-sparse-keymap)))
-            ;; ref. of the Engram layout with numeric layer activated
-			;; > b y o u ' ( d n g v q
-			;; 0 1 2 3 4 , . 5 6 7 8 9
-			;; ~ ^ # * & - ? @ = + $ /
-			(define-key map (kbd "&") (lambda () (interactive) (csound-cycle-column 2  1 0))) ; p3 forward full
-			(define-key map (kbd "*") (lambda () (interactive) (csound-cycle-column 2 -1 0))) ; p3 backward full
-			(define-key map (kbd "@") (lambda () (interactive) (csound-cycle-column 4  1 1))) ; p5 forward decimal
-			(define-key map (kbd "=") (lambda () (interactive) (csound-cycle-column 4 -1 1))) ; p5 backward decimal
-            (define-key map (kbd "<TAB>") #'csound-score-align)
-            (define-key map (kbd "<backtab>") 'csound-recalculate-starts)
-            (define-key map (kbd "n") #'csound-start)
-			(define-key map (kbd "o") #'csound-stop-and-log)
-			(define-key map (kbd "N w") #'csound-record-wav)
-			(define-key map (kbd "N o") #'csound-record-ogg)
-			(define-key map (kbd "q") #'csound-header-edit)
-			(define-key map (kbd "d") #'duplicate-line)
-			(define-key map (kbd "g") #'csound-smart-duplicate)
-			(define-key map (kbd "G") #'csound-custom-duplicate)
-			(define-key map (kbd "C-G") #'csound-custom-duplicate-repeat)
-			(define-key map (kbd "y") #'play-from-value)
-			(define-key map (kbd "Y") #'which-play-value-show)
-			(define-key map (kbd "v") #'which-play-value-modify)
-			(define-key map (kbd "b") #'play-from-zero)
-			(define-key map (kbd "u") (lambda () (interactive) (insert "1.02197503906")))
-			;; instruments shortcut ;;
-			(define-key map (kbd "C-c r") (lambda () (interactive) (insert "; bf0000's keyboard\n\n;12 STR DUR AMP NOTE KC1 KC2 VDEPTH STR VRATE END EDO REPEAT BASE")))
-			(define-key map (kbd "C-c g") (lambda () (interactive) (insert "; 00b100's lyre\n\n;9 STR DUR AMP NOTE PLK PICK REFL EDO REPEAT BASE")))
-			(define-key map (kbd "C-c b") (lambda () (interactive) (insert "; 3044eb's violin\n\n;11 STR DUR AMP NOTE PRES RAT STR VIBF END VAMP EDO REPEAT BASE")))
-			(define-key map (kbd "C-c y") (lambda () (interactive) (insert "; 9e9b00's vibraphone\n\n;10 STR DUR AMP NOTE HRD POS STR VIBF END EDO REPEAT BASE")))
-            map)
+  :init-value nil
+  :lighter " csound"
+  :keymap csound-mode-map  ; Explicitly point to our base map
   (if csound-mode
       (progn
         (modify-syntax-entry ?\. "w" (syntax-table))
-		(visual-line-mode -1)
-		(setq truncate-lines t)
-		(harvest-all-columns-to-cycle-list))
+        (visual-line-mode -1)
+        (setq truncate-lines t)
+        (harvest-all-columns-to-cycle-list))
     (progn
-      (text-mode)
       (modify-syntax-entry ?\. "." (syntax-table))
-	  (visual-line-mode 1)
-	  (setq truncate-lines nil))))
+      (visual-line-mode 1)
+      (setq truncate-lines nil))))
 
-(global-set-key (kbd "%") 'csound-mode) ; global shortcut as we need to return from text-mode
+(defun csound-toggle-layout ()
+  "Manually toggle csound-mode shortcuts between Engram and QWERTY."
+  (interactive)
+  (if (eq csound-active-layout 'engram)
+      (progn
+        (setq csound-active-layout 'qwerty)
+        (set-keymap-parent csound-mode-map csound-qwerty-map)
+        (message "Keyboard Layout: QWERTY"))
+    (progn
+      (setq csound-active-layout 'engram)
+      (set-keymap-parent csound-mode-map csound-engram-map)
+      (message "Keyboard Layout: ENGRAM"))))
 
-(add-hook 'fundamental-mode-hook 'csound-mode) ; ASSOCIATE MAJOR MODE WITH A MINOR MODE
+;; Optional: Bind the toggle to a global key so you can hit it anytime
+;; (global-set-key (kbd "C-c l") 'csound-toggle-layout)
 
-;; tight spacing when we arrange the score ;;
-(add-hook 'fundamental-mode-hook
-          (lambda ()
-            ;; Adjust this number (-1, 0, 1, 2) to get the exact compactness you like
-            (setq line-spacing -1)))
+;; gotta change this to text-mode only!
+;;(global-set-key (kbd "%") 'csound-mode) ; global shortcut as we need to return from text-mode
 
-;; ASSOCIATE FILES WITH A MODE ;;
-(add-to-list 'auto-mode-alist '("\\.sco\\'" . fundamental-mode))
+;; Create a lightweight major mode derived from text-mode
+(define-derived-mode csound-score-mode text-mode "Csound Score"
+  "Major mode for editing Csound files, triggering csound-mode automatically."
+  (csound-mode 1)         ; Activate your custom minor mode
+  (setq line-spacing -1)) ; Apply your tight line spacing
+
+;; Associate .sco files with this new major mode
+(add-to-list 'auto-mode-alist '("\\.sco\\'" . csound-score-mode))
