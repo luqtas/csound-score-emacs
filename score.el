@@ -248,7 +248,7 @@ Returns 0.0 if the line cannot be found or is malformed."
         (setq csound-start-time nil))
     (message "Csound stopped. No active timer to reset.")))
 
-(defun which-play-value-show ()
+(defun print-start-value ()
   "Print the 4th column of the advance statement. (Does not trigger Csound)."
   (interactive)
   (save-excursion
@@ -262,28 +262,29 @@ Returns 0.0 if the line cannot be found or is malformed."
               (error "The advance statement does not have 4 columns."))))
       (error "Could not find '; advance statement ;' in the buffer."))))
 
-(defun which-play-value-modify (arg)
-  "Modify the advance statement's 4th column and start Csound.
-With no prefix (y), harvests the 2nd column of the current line.
-With a prefix (C-u y), prompts for N and searches for 'pN'."
-  (interactive "P")
+(defun play-from-cursor ()
+  "Modify the advance statement using column 2 of the CURRENT line and start Csound."
+  (interactive)
+  (let ((a (csound--get-number-at-column 2)))
+    (if a
+        (progn
+          (csound--set-advance-start a)
+          (log-csound-start)
+          (csound-start)
+          (message "Updated advance statement to %s and started Csound!" a))
+      (error "Could not harvest a valid value from column 2."))))
+
+(defun play-from-point ()
+  "Prompt for N, search for 'pN', and use its line's column 2 to start Csound."
+  (interactive)
   (let (a)
-    (if arg
-        ;; --- Pathway 1: C-u y (Search for pN) ---
-        (save-excursion
-          ;; Use read-number to accept multi-digit inputs and %d to format the integer
-          (let* ((num (read-number "Enter number: "))
-                 (target (format "p%d" num)))
-            (goto-char (point-min))
-            (if (search-forward target nil t)
-                ;; Harvest using your custom function on the found line
-                (setq a (csound--get-number-at-column 2))
-              (error "Could not find '%s' in the buffer." target))))
-
-      ;; --- Pathway 2: Plain y (Harvest current line) ---
-      (setq a (csound--get-number-at-column 2)))
-
-    ;; --- Apply the modification using your custom functions ---
+    (save-excursion
+      (let* ((num (read-number "Enter number: "))
+             (target (format "p%d" num)))
+        (goto-char (point-min))
+        (if (search-forward target nil t)
+            (setq a (csound--get-number-at-column 2))
+          (error "Could not find '%s' in the buffer." target))))
     (if a
         (progn
           (csound--set-advance-start a)
@@ -966,29 +967,37 @@ Typical keymap usage:
   "The current manual keyboard layout for csound-mode ('engram or 'qwerty).")
 
 ;; --- ENGRAM LAYER ---
+
+;; > b y o u '    ( d n g v q
+;; 0 1 2 3 4 ,    . 5 6 7 8 9
+;; ~ ^ # * & -    ? @ = + $ /
+
 (defvar csound-engram-map
   (let ((map (make-sparse-keymap)))
     ;; general shortcuts ;;
-    (define-key map (kbd "o") #'csound-start)
-    (define-key map (kbd "O") #'csound-stop-and-log)
-    (define-key map (kbd "M-o") #'csound-stop-and-track)
-    (define-key map (kbd "N w") #'csound-record-wav)
-    (define-key map (kbd "N o") #'csound-record-ogg)
-    (define-key map (kbd "q") #'csound-header-edit)
-    (define-key map (kbd "d") #'duplicate-line)
-    (define-key map (kbd "g") #'csound-smart-duplicate)
-    (define-key map (kbd "G") #'csound-custom-duplicate)
-    (define-key map (kbd "C-G") #'csound-custom-duplicate-repeat)
-    (define-key map (kbd "y") #'play-from-value)
-    (define-key map (kbd "Y") #'which-play-value-show)
-    (define-key map (kbd "v") #'which-play-value-modify)
-    (define-key map (kbd "b") #'play-from-zero)
-    (define-key map (kbd "u") (lambda () (interactive) (insert "1.02197503906")))
+    (define-key map (kbd "u")           #'csound-start)
+    (define-key map (kbd "U")           #'csound-stop-and-log)
+    (define-key map (kbd "M-u")         #'csound-stop-and-track)
+    (define-key map (kbd "C-c u w")     #'csound-record-wav)
+    (define-key map (kbd "C-c u o")     #'csound-record-ogg)
+    (define-key map (kbd "o")           #'play-from-value)
+    (define-key map (kbd "y")           #'play-from-cursor)
+    (define-key map (kbd "b")           #'play-from-zero)
+    (define-key map (kbd "B")           #'play-from-point)
+    (define-key map (kbd "M-b")         #'print-start-value)
+
+    (define-key map (kbd "d")           #'duplicate-line)
+    (define-key map (kbd "n")           #'csound-smart-duplicate)
+    (define-key map (kbd "N")           #'csound-custom-duplicate)
+    (define-key map (kbd "C-N")         #'csound-custom-duplicate-repeat)
+
+    (define-key map (kbd "Q")           #'csound-header-edit)
+    (define-key map (kbd "M-q") (lambda () (interactive) (insert "1.02197503906")))
 
     ;; p-field cycle ;;
-    (define-key map (kbd "&") (lambda () (interactive) (csound-cycle-column 2  1 0)))
+    (define-key map (kbd "&") (lambda () (interactive) (csound-cycle-column 2  1 0))) ; dur
     (define-key map (kbd "*") (lambda () (interactive) (csound-cycle-column 2 -1 0)))
-    (define-key map (kbd "@") (lambda () (interactive) (csound-cycle-column 4  1 1)))
+    (define-key map (kbd "@") (lambda () (interactive) (csound-cycle-column 4  1 1))) ; note
     (define-key map (kbd "=") (lambda () (interactive) (csound-cycle-column 4 -1 1)))
     map)
   "Engram-specific shortcuts for csound-mode.")
@@ -1092,7 +1101,7 @@ Typical keymap usage:
 ;; (global-set-key (kbd "C-c l") 'csound-toggle-layout)
 
 ;; gotta change this to text-mode only!
-;;(global-set-key (kbd "%") 'csound-mode) ; global shortcut as we need to return from text-mode
+(global-set-key (kbd "C-c t") 'csound-mode) ; global shortcut as we need to return from text-mode
 
 ;; Create a lightweight major mode derived from text-mode
 (define-derived-mode csound-score-mode text-mode "Csound Score"
