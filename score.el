@@ -688,12 +688,32 @@ The original buffer is NEVER modified.  Any previous temp file is deleted."
     (setq csound--resolved-tempfile tmpfile)
     tmpfile))
 
-;; workflow for cycling through "scales" (typed notes at the score) ;;
-;; 1. VARIABLES (Buffer-local so files don't mix)
-(defvar-local my-column-cycles '() "Alist for full-field cycling.")
-(defvar-local my-column-decimal-cycles '() "Alist for decimal-only cycling.")
+;; 1. VARIABLES & CORE HELPERS (Buffer-local so files don't mix)
+(defvar-local csound-cycle-local-p nil
+  "Non-nil means `csound-cycle-column` harvests from the local paragraph instead of globally.")
+(defun csound-toggle-cycle-scope ()
+  "Toggle column cycling between global and local-only, updating the status bar."
+  (interactive)
+  (setq csound-cycle-local-p (not csound-cycle-local-p))
+  (message "Csound cycle scope: %s" (if csound-cycle-local-p "LOCAL" "GLOBAL"))
+  (force-mode-line-update))
+(defvar-local my-inst-column-cycles '()
+  "Alist mapping Instrument ID -> Column Index -> Full-field cycle lists.")
+(defvar-local my-inst-column-decimal-cycles '()
+  "Alist mapping Instrument ID -> Column Index -> Decimal-only cycle lists.")
 (defvar-local current-field-index 0 "Stores the detected column index.")
-;; 2. HELPER: The Smart Splitter (The missing function!)
+
+(defun csound--sort-numeric (lst)
+  "Sort a list of numeric strings numerically."
+  (sort (copy-sequence lst)
+        (lambda (a b) (< (string-to-number a) (string-to-number b)))))
+
+(defun csound--extract-inst-id (p1)
+  "Extract the instrument number from a p1 string (e.g., 'i9' -> '9')."
+  (when (and (stringp p1) (string-match "^[iI]\\s-*\\([0-9]+\\)" p1))
+    (match-string 1 p1)))
+
+;; 2. HELPER: The Smart Splitter
 (defun csound-split-line (line)
   "Split a Csound score line, keeping [...] expressions together. Ignores inline comments."
   (let* ((code-only (if (string-match ";" line)
@@ -705,61 +725,105 @@ The original buffer is NEVER modified.  Any previous temp file is deleted."
       (push (match-string 0 code-only) fields)
       (setq start (match-end 0)))
     (nreverse fields)))
-;; 3. THE HARVEST: Scans the file for all possible values
 
+;; 3. THE HARVEST (Global & Local)
 (defun csound--harvest-include-p (fields)
-  "Return t only if this score line should be harvested.
-Only i-statements for instruments other than 1 qualify.
-All other opcodes (a b B C d e f m n q r s t v x y, …) are excluded —
-they carry no musically cyclable p-field data."
+  "Return t only if this score line should be harvested (excludes instrument 1)."
   (when fields
     (let ((p1 (nth 0 fields))
           (p2 (nth 1 fields)))
       (and (stringp p1)
-           ;; Must be an i-statement (bare 'i'/'I' or compact 'i2', 'i3', …)
            (string-match-p "^[iI]" p1)
-           ;; Exclude instrument 1  (i1 / i 1)
            (not (string-match-p "^[iI]1$" p1))
            (not (and (string-match-p "^[iI]$" p1)
                      (stringp p2) (string= p2 "1")))))))
 
 (defun harvest-all-columns-to-cycle-list ()
-  "Scan the whole document and build full-value AND decimal-only cycle lists.
-Only i-statements for instruments other than 1 are harvested."
+  "Scan the document, harvest raw decimals, and sort them numerically."
   (interactive)
-  (setq my-column-cycles '()
-        my-column-decimal-cycles '())
+  (setq my-inst-column-cycles '()
+        my-inst-column-decimal-cycles '())
+
   (save-excursion
     (goto-char (point-min))
-    (forward-line 5) ;; Skip header
+    ;; REMOVED: (forward-line 5)
+    ;; csound--harvest-include-p already ignores non-i statements safely.
     (while (not (eobp))
       (let* ((line-text (buffer-substring-no-properties (line-beginning-position) (line-end-position)))
              (line-fields (csound-split-line line-text)))
-        (when (and line-fields
-                   (csound--harvest-include-p line-fields))
-          (cl-loop for val in line-fields
-                   for idx from 0
-                   do (unless (string= val ".")
-                        ;; Full Value Harvest
-                        (let ((full-list (alist-get idx my-column-cycles)))
-                          (unless (member val full-list)
-                            (setf (alist-get idx my-column-cycles)
-                                  (append full-list (list val)))))
-                        ;; Decimal Harvest
-                        (when (string-match "\\.\\([0-9]+\\)" val)
-                          (let ((dec (match-string 1 val))
-                                (dec-list (alist-get idx my-column-decimal-cycles)))
-                            (setq dec (if (= (length dec) 1) (concat dec "0") dec))
-                            (unless (member dec dec-list)
-                              (setf (alist-get idx my-column-decimal-cycles)
-                                    (append dec-list (list dec))))))))))
+        (when (and line-fields (csound--harvest-include-p line-fields))
+          (let* ((inst-str (csound--extract-inst-id (nth 0 line-fields)))
+                 (inst-id (when inst-str (string-to-number inst-str))))
+            (when inst-id
+              (cl-loop for val in line-fields
+                       for idx from 0
+                       do (unless (string= val ".")
+                            ;; 1. Full Value Harvest (Keep raw)
+                            (let ((inst-alist (alist-get inst-id my-inst-column-cycles)))
+                              (unless (member val (alist-get idx inst-alist))
+                                (push val (alist-get idx inst-alist))
+                                (setf (alist-get inst-id my-inst-column-cycles) inst-alist)))
+
+                            ;; 2. Decimal Harvest (Keep raw)
+                            (when (string-match "\\.\\([0-9]+\\)" val)
+                              (let* ((raw-dec (match-string 1 val))
+                                     (inst-alist (alist-get inst-id my-inst-column-decimal-cycles)))
+                                (unless (member raw-dec (alist-get idx inst-alist))
+                                  (push raw-dec (alist-get idx inst-alist))
+                                  (setf (alist-get inst-id my-inst-column-decimal-cycles) inst-alist))))))))))
       (forward-line 1)))
-  (dolist (cell my-column-decimal-cycles)
-    (setcdr cell (sort (cdr cell) 'string-lessp)))
-  (message "Harvest Complete: Full fields and Decimals stored."))
-;; 4. FIELD CYCLING
+
+    ;; 3. Sort Numerically
+    (dolist (inst-cell my-inst-column-decimal-cycles)
+      (dolist (col-cell (cdr inst-cell))
+        (setcdr col-cell (sort (cdr col-cell)
+                               (lambda (a b)
+                                 (< (string-to-number (concat "0." a))
+                                    (string-to-number (concat "0." b))))))))
+
+    (message "Harvest Complete: Raw data stored and sorted numerically."))
+
+(defun csound--harvest-local-paragraph (target-inst target-col decimal-only)
+  "Harvest values on-the-fly for TARGET-INST at TARGET-COL in the current visual block."
+  (let ((results '()))
+    (save-excursion
+      ;; 1. Move to the very start of the visual block (scan up to blank line)
+      (beginning-of-line)
+      (while (and (not (bobp))
+                  (not (looking-at-p "^\\s-*$")))
+        (forward-line -1))
+      (when (looking-at-p "^\\s-*$")
+        (forward-line 1))
+
+      ;; 2. Process line-by-line until we hit a blank line or end of buffer
+      (while (and (not (eobp))
+                  (not (looking-at-p "^\\s-*$")))
+        (let* ((line (buffer-substring-no-properties (line-beginning-position) (line-end-position)))
+               (fields (csound-split-line line)))
+          (when (and fields (csound--harvest-include-p fields))
+            (let* ((inst-str (csound--extract-inst-id (nth 0 fields)))
+                   (inst-id (when inst-str (string-to-number inst-str))))
+              (when (and inst-id (= inst-id target-inst) (> (length fields) target-col))
+                (let ((val (nth target-col fields)))
+                  (unless (string= val ".")
+                    (if (= decimal-only 1)
+                        (when (string-match "\\.\\([0-9]+\\)" val)
+                          (let ((dec (match-string 1 val)))
+                            (setq dec (if (= (length dec) 1) (concat dec "0") dec))
+                            (unless (member dec results) (push dec results))))
+                      (unless (member val results) (push val results)))))))))
+        (forward-line 1)))
+
+    ;; 3. Apply the sorted results
+    (if (= decimal-only 1)
+        (sort results (lambda (a b)
+                        (< (string-to-number (concat "0." a))
+                           (string-to-number (concat "0." b)))))
+      (csound--sort-numeric results))))
+
+;; 4. FIELD CYCLING (Free cursor)
 (defun cycle-current-field (direction)
-  "Cycles the whole field at point."
+  "Cycles the whole field at point based on the instrument ID."
   (interactive "p")
   (let* ((line-beg (line-beginning-position))
          (orig-point (point))
@@ -772,11 +836,14 @@ Only i-statements for instruments other than 1 are harvested."
             (when (and (>= orig-point m-beg) (<= orig-point m-end)) (setq found-idx idx))
             (setq start (match-end 0) idx (1+ idx))))
         (setq current-field-index (or found-idx 0))))
-    (let* ((column-list (cdr (assoc current-field-index my-column-cycles)))
-           (line-fields (csound-split-line (buffer-substring-no-properties line-beg (line-end-position))))
+    (let* ((line-fields (csound-split-line (buffer-substring-no-properties line-beg (line-end-position))))
+           (inst-str (csound--extract-inst-id (nth 0 line-fields)))
+           (inst-id (when inst-str (string-to-number inst-str)))
+           (inst-alist (alist-get inst-id my-inst-column-cycles))
+           (column-list (alist-get current-field-index inst-alist))
            (current-val (nth current-field-index line-fields)))
       (if (not (and current-val column-list))
-          (message "No data for Col %d." (1+ current-field-index))
+          (message "No data for Col %d (Inst %s)." (1+ current-field-index) (or inst-id "None"))
         (let* ((pos (or (cl-position current-val column-list :test 'string=) -1))
                (new-pos (mod (+ pos direction) (length column-list)))
                (new-val (nth new-pos column-list)))
@@ -789,9 +856,10 @@ Only i-statements for instruments other than 1 are harvested."
                   (setq start (match-end 0) count (1+ count))))
               (when rbeg (delete-region rbeg rend) (goto-char rbeg) (insert new-val)
                     (when (fboundp 'csound-score-align) (csound-score-align))))))))))
-;; 5. DECIMAL CYCLING
+
+;; 5. DECIMAL CYCLING (Free cursor)
 (defun cycle-decimal-part (direction)
-  "Cycles only the decimal part of the value at point."
+  "Cycles only the decimal part of the value at point based on the instrument ID."
   (interactive "p")
   (let* ((line-beg (line-beginning-position))
          (orig-point (point))
@@ -803,9 +871,14 @@ Only i-statements for instruments other than 1 are harvested."
           (let ((mb (+ line-beg (match-beginning 0))) (me (+ line-beg (match-end 0))))
             (when (and (>= orig-point mb) (<= orig-point me)) (setq detected-idx idx))
             (setq start (match-end 0) idx (1+ idx))))))
-    (let* ((decimal-list (alist-get detected-idx my-column-decimal-cycles))
+    (let* ((line-fields (csound-split-line (buffer-substring-no-properties line-beg (line-end-position))))
+           (inst-str (csound--extract-inst-id (nth 0 line-fields)))
+           (inst-id (when inst-str (string-to-number inst-str)))
+           (inst-dec-alist (alist-get inst-id my-inst-column-decimal-cycles))
+           (decimal-list (alist-get detected-idx inst-dec-alist))
            (thing (thing-at-point 'symbol)))
-      (if (and thing decimal-list (string-match "\\([0-9]+\\)\\.\\([0-9]*\\)" thing))
+      ;; Fixed Regex: Allows no-leading-zero decimals like .1825
+      (if (and thing decimal-list (string-match "^\\([-+]?[0-9]*\\)\\.\\([0-9]*\\)$" thing))
           (let* ((int-part (match-string 1 thing))
                  (cur-dec (match-string 2 thing))
                  (cur-dec-c (if (string= cur-dec "") "00" (if (= (length cur-dec) 1) (concat cur-dec "0") cur-dec)))
@@ -821,22 +894,12 @@ Only i-statements for instruments other than 1 are harvested."
 
 ;; 6. P-FIELD NAVIGATION (TAB / SHIFT-TAB)
 (defun csound-score-goto-field (direction)
-  "Move cursor to the end of the next (DIRECTION = +1) or previous
-(DIRECTION = -1) p-field on the current line.
-
-Tokens are collected up to the first ';' so inline comments are
-ignored.  Any value — numbers, symbols (. ^ +), macros (^+N +-N),
-or bracket expressions ([...]) — counts as a field.
-
-When the cursor sits inside field N, TAB lands at the end of field
-N+1; Shift-TAB lands at the end of field N-1.  Both directions clamp
-at the first / last field instead of wrapping."
+  "Move cursor to the end of the next (DIRECTION = +1) or previous (DIRECTION = -1) p-field."
   (let* ((line-beg  (line-beginning-position))
-         (code-end  (csound--code-end-position)) ; stops before ';'
+         (code-end  (csound--code-end-position))
          (line-text (buffer-substring-no-properties line-beg code-end))
-         (fields    nil)   ; list of (buf-beg . buf-end) for each token
+         (fields    nil)
          (scan      0))
-    ;; Collect every token span in buffer coordinates.
     (while (string-match "\\[[^]]+\\]\\|\\S-+" line-text scan)
       (push (cons (+ line-beg (match-beginning 0))
                   (+ line-beg (match-end       0)))
@@ -846,61 +909,119 @@ at the first / last field instead of wrapping."
     (when fields
       (let* ((pos     (point))
              (n       (length fields))
-             ;; cur-idx: the index of the field that contains point.
-             ;; Falls back to the last field whose end is <= point,
-             ;; which handles "cursor is between tokens" naturally.
-             ;; Stays -1 only when point is before every token.
              (cur-idx -1))
         (cl-loop for span in fields
                  for i   from 0
-                 ;; "inside or at the very end of" this token
                  when (and (>= pos (car span)) (<= pos (cdr span)))
                  do (setq cur-idx i))
         (when (= cur-idx -1)
-          ;; Point is not inside any token — find the last token that
-          ;; ends at or before point (i.e. cursor is in whitespace
-          ;; after that token).
           (cl-loop for span in fields
                    for i   from 0
                    when (<= (cdr span) pos)
                    do (setq cur-idx i)))
-        ;; Compute the target index, clamping at boundaries.
         (let* ((new-idx (+ cur-idx direction))
                (clamped (max 0 (min (1- n) new-idx))))
           (goto-char (cdr (nth clamped fields))))))))
 
 ;; 7. PINNED-COLUMN CYCLING
-(defun csound-cycle-column (col-idx direction decimal-only)
-  "Cycle a fixed p-field column regardless of where the cursor is.
+(defun csound-cycle-column (col-idx direction decimal-only &optional local-only)
+  "Cycle a fixed p-field column based the current scope.
 
-COL-IDX    — 0-based field index (so p1=0, p2=1, p3=2, …).
-DIRECTION  — +1 forward, -1 backward through the harvested list.
-DECIMAL-ONLY — 0 cycles the whole field value (uses `my-column-cycles');
-               1 cycles only the decimal part  (uses `my-column-decimal-cycles').
-
-The cursor is restored to its exact pre-call position after the edit and
-after the alignment pass, using a buffer marker so character-position
-shifts from text replacement don't corrupt the saved location.
-
-Typical keymap usage:
-  (define-key map (kbd \"'\") (lambda () (interactive) (csound-cycle-column 3 1  0)))
-  (define-key map (kbd \"(\") (lambda () (interactive) (csound-cycle-column 3 -1 0)))
-  (define-key map (kbd \"'\") (lambda () (interactive) (csound-cycle-column 5 1  1)))"
-  (let* (;; Pin the cursor with a marker so alignment can't lose it.
-         (cursor-marker (copy-marker (point) t))
+COL-IDX      — 0-based field index (so p1=0, p2=1, p3=2, …).
+DIRECTION    — +1 forward, -1 backward.
+DECIMAL-ONLY — 0 for full-field, 1 for decimal only.
+LOCAL-ONLY   — 1 to force local, 0 to force global (current inst), 2 to force ALL insts.
+               If omitted, defaults to `csound-cycle-scope` toggle."
+  (let* ((cursor-marker (copy-marker (point) t))
          (line-beg  (line-beginning-position))
          (line-text (buffer-substring-no-properties line-beg (line-end-position)))
          (fields    (csound-split-line line-text))
-         (cur-val   (nth col-idx fields)))
-    (if (= decimal-only 0)
-        ;; ── FULL-FIELD mode ────────────────────────────────────────────────
-        (let* ((column-list (cdr (assoc col-idx my-column-cycles))))
-          (if (not (and cur-val column-list))
-              (message "csound-cycle-column: no harvest data for field %d." (1+ col-idx))
-            (let* ((pos     (or (cl-position cur-val column-list :test #'string=) -1))
-                   (new-pos (mod (+ pos direction) (length column-list)))
-                   (new-val (nth new-pos column-list))
-                   ;; Locate the token boundaries inside the live buffer.
+         (cur-val   (nth col-idx fields))
+         (inst-str  (csound--extract-inst-id (nth 0 fields)))
+         (inst-id   (when inst-str (string-to-number inst-str)))
+
+         ;; 1. Determine effective scope (argument overrides the toggle)
+         (scope (cond ((eq local-only 1) 'local)
+                      ((eq local-only 2) 'all)
+                      ((eq local-only 0) 'global)
+                      (t (if (boundp 'csound-cycle-scope) csound-cycle-scope 'global)))))
+
+    (if (not inst-id)
+        (message "csound-cycle-column: Could not detect valid Instrument ID.")
+      (let ((target-list
+             (cond
+              ;; SCOPE: LOCAL
+              ((eq scope 'local)
+               (csound--harvest-local-paragraph inst-id col-idx decimal-only))
+
+              ;; SCOPE: ALL INSTRUMENTS
+              ((eq scope 'all)
+               (let ((combined '())
+                     (source-alist (if (= decimal-only 1)
+                                       my-inst-column-decimal-cycles
+                                     my-inst-column-cycles)))
+                 ;; Harvest from every instrument in the alist
+                 (dolist (inst-cell source-alist)
+                   (let ((col-list (alist-get col-idx (cdr inst-cell))))
+                     ;; CRITICAL FIX: copy-sequence prevents destructive functions
+                     ;; from mutating and deleting your global harvest data.
+                     (setq combined (append combined (copy-sequence col-list)))))
+
+                 ;; Remove duplicates and sort the safe copy
+                 (setq combined (delete-dups combined))
+                 (if (= decimal-only 1)
+                     (sort combined (lambda (a b) (< (string-to-number (concat "0." a))
+                                                     (string-to-number (concat "0." b)))))
+                   (csound--sort-numeric combined))))
+
+              ;; SCOPE: GLOBAL (Current Instrument Only)
+              (t
+               (let ((inst-alist (alist-get inst-id (if (= decimal-only 1)
+                                                        my-inst-column-decimal-cycles
+                                                      my-inst-column-cycles))))
+                 (alist-get col-idx inst-alist))))))
+
+        (if (= decimal-only 0)
+            ;; ── FULL-FIELD mode ────────────────────────────────────────────────
+            (if (not (and cur-val target-list))
+                (message "No harvest data found for field %d." (1+ col-idx))
+              (let* ((pos     (or (cl-position cur-val target-list :test #'string=) -1))
+                     (new-pos (mod (+ pos direction) (length target-list)))
+                     (new-val (nth new-pos target-list))
+                     (rbeg nil) (rend nil)
+                     (scan-start 0) (count 0)
+                     (lt (buffer-substring-no-properties line-beg (line-end-position))))
+                (while (and (not rbeg)
+                            (string-match "\\[[^]]+\\]\\|\\S-+" lt scan-start))
+                  (if (= count col-idx)
+                      (setq rbeg (+ line-beg (match-beginning 0))
+                            rend (+ line-beg (match-end 0)))
+                    (setq scan-start (match-end 0) count (1+ count))))
+                (when rbeg
+                  (delete-region rbeg rend)
+                  (goto-char rbeg)
+                  (insert new-val)
+                  (when (fboundp 'csound-score-align) (csound-score-align))
+                  (message "[Inst %d | %s] p%d → %s" inst-id
+                           (upcase (symbol-name scope))
+                           (1+ col-idx) new-val))))
+
+          ;; ── DECIMAL-ONLY mode ──────────────────────────────────────────────
+          (if (not (and cur-val target-list (string-match "^\\([-+]?[0-9]*\\)\\.\\([0-9]*\\)$" cur-val)))
+              (message "No decimal data found for field %d." (1+ col-idx))
+            (let* ((int-part  (match-string 1 cur-val))
+                   (int-num   (string-to-number int-part))
+                   (cur-dec   (match-string 2 cur-val))
+                   (cur-dec-c (cond ((string= cur-dec "")  "00")
+                                    ((= (length cur-dec) 1) (concat cur-dec "0"))
+                                    (t cur-dec)))
+                   (list-len  (length target-list))
+                   (pos       (or (cl-position cur-dec-c target-list :test #'string=) -1))
+                   (wrap-fwd  (and (= direction  1) (= pos (1- list-len))))
+                   (wrap-bwd  (and (= direction -1) (= pos 0)))
+                   (new-int   (+ int-num (cond (wrap-fwd  1) (wrap-bwd -1) (t 0))))
+                   (new-pos   (mod (+ pos direction) list-len))
+                   (new-dec   (nth new-pos target-list))
                    (rbeg nil) (rend nil)
                    (scan-start 0) (count 0)
                    (lt (buffer-substring-no-properties line-beg (line-end-position))))
@@ -909,57 +1030,22 @@ Typical keymap usage:
                 (if (= count col-idx)
                     (setq rbeg (+ line-beg (match-beginning 0))
                           rend (+ line-beg (match-end 0)))
-                  (setq scan-start (match-end 0)
-                        count      (1+ count))))
-              (when rbeg
+                  (setq scan-start (match-end 0) count (1+ count))))
+              (when (and rbeg new-dec)
                 (delete-region rbeg rend)
                 (goto-char rbeg)
-                (insert new-val)
+                (let ((final-int-str (if (or wrap-fwd wrap-bwd)
+                                         (number-to-string new-int)
+                                       int-part)))
+                  (insert (concat final-int-str "." new-dec)))
                 (when (fboundp 'csound-score-align) (csound-score-align))
-                (message "p%d → %s" (1+ col-idx) new-val)))))
-      ;; ── DECIMAL-ONLY mode ──────────────────────────────────────────────
-      (let* ((decimal-list (alist-get col-idx my-column-decimal-cycles)))
-        (if (not (and cur-val decimal-list
-                      (string-match "\\([0-9]+\\)\\.\\([0-9]*\\)" cur-val)))
-            (message "csound-cycle-column: no decimal data for field %d (value: %s)."
-                     (1+ col-idx) (or cur-val "nil"))
-          (let* ((int-part  (match-string 1 cur-val))
-                 (int-num   (string-to-number int-part))
-                 (cur-dec   (match-string 2 cur-val))
-                 (cur-dec-c (cond ((string= cur-dec "")  "00")
-                                  ((= (length cur-dec) 1) (concat cur-dec "0"))
-                                  (t cur-dec)))
-                 (list-len  (length decimal-list))
-                 (pos       (or (cl-position cur-dec-c decimal-list :test #'string=) -1))
-                 ;; Detect wrap-around only when the current decimal is known.
-                 ;; Forward past the last  -> carry  +1 to the integer part.
-                 ;; Backward past the first -> borrow -1 from the integer part.
-                 (wrap-fwd  (and (= direction  1) (= pos (1- list-len))))
-                 (wrap-bwd  (and (= direction -1) (= pos 0)))
-                 (new-int   (+ int-num (cond (wrap-fwd  1)
-                                             (wrap-bwd -1)
-                                             (t         0))))
-                 (new-pos   (mod (+ pos direction) list-len))
-                 (new-dec   (nth new-pos decimal-list))
-                 ;; Find the token in the live buffer (same scan as full-field).
-                 (rbeg nil) (rend nil)
-                 (scan-start 0) (count 0)
-                 (lt (buffer-substring-no-properties line-beg (line-end-position))))
-            (while (and (not rbeg)
-                        (string-match "\\[[^]]+\\]\\|\\S-+" lt scan-start))
-              (if (= count col-idx)
-                  (setq rbeg (+ line-beg (match-beginning 0))
-                        rend (+ line-beg (match-end 0)))
-                (setq scan-start (match-end 0)
-                      count      (1+ count))))
-            (when (and rbeg new-dec)
-              (delete-region rbeg rend)
-              (goto-char rbeg)
-              (insert (concat (number-to-string new-int) "." new-dec))
-              (when (fboundp 'csound-score-align) (csound-score-align))
-              (message "p%d -> %d.%s%s" (1+ col-idx) new-int new-dec
-                       (cond (wrap-fwd " (carry +1)") (wrap-bwd " (borrow -1)") (t ""))))))))
-    ;; Restore cursor unconditionally, after both branches and after alignment.
+                (message "[Inst %d | %s] p%d -> %s.%s%s" inst-id
+                         (upcase (symbol-name scope))
+                         (1+ col-idx)
+                         (if (or wrap-fwd wrap-bwd) (number-to-string new-int) int-part)
+                         new-dec
+                         (cond (wrap-fwd " (carry +1)") (wrap-bwd " (borrow -1)") (t "")))))))))
+
     (goto-char cursor-marker)
     (set-marker cursor-marker nil)))
 
@@ -986,6 +1072,8 @@ Typical keymap usage:
     (define-key map (kbd "B")           #'play-from-point)
     (define-key map (kbd "M-b")         #'print-start-value)
 
+    (define-key map (kbd "M-.")         #'csound-toggle-cycle-scope)
+
     (define-key map (kbd "d")           #'duplicate-line)
     (define-key map (kbd "n")           #'csound-smart-duplicate)
     (define-key map (kbd "N")           #'csound-custom-duplicate)
@@ -997,8 +1085,10 @@ Typical keymap usage:
     ;; p-field cycle ;;
     (define-key map (kbd "&") (lambda () (interactive) (csound-cycle-column 2  1 0))) ; dur
     (define-key map (kbd "*") (lambda () (interactive) (csound-cycle-column 2 -1 0)))
-    (define-key map (kbd "@") (lambda () (interactive) (csound-cycle-column 4  1 1))) ; note
+    (define-key map (kbd "@") (lambda () (interactive) (csound-cycle-column 4  1 1))) ; note global
     (define-key map (kbd "=") (lambda () (interactive) (csound-cycle-column 4 -1 1)))
+    (define-key map (kbd "+") (lambda () (interactive) (csound-cycle-column 4  1 1 1))) ; note local
+    (define-key map (kbd "$") (lambda () (interactive) (csound-cycle-column 4 -1 1 1)))
     map)
   "Engram-specific shortcuts for csound-mode.")
 
@@ -1067,12 +1157,36 @@ Typical keymap usage:
     map)
   "Base keymap for csound-mode. Inherits from active layout.")
 
+;; 1. Upgrade variable from boolean to symbol
+(defvar-local csound-cycle-scope 'global
+  "Current scope for `csound-cycle-column`. Can be 'global, 'local, or 'all.")
+
+;; 2. Upgrade the lighter to check all 3 states
+(defvar csound-mode-lighter '(:eval (pcase csound-cycle-scope
+                                      ('local " cycle[L]")
+                                      ('all   " cycle[A]")
+                                      (_      " cycle[G]")))
+  "Dynamic mode-line indicator for `csound-mode`.")
+(put 'csound-mode-lighter 'risky-local-variable t)
+
+;; 3. Make the toggle function cycle in a 3-way loop
+(defun csound-toggle-cycle-scope ()
+  "Toggle column cycling between global, local, and all instruments."
+  (interactive)
+  (setq csound-cycle-scope
+        (pcase csound-cycle-scope
+          ('global 'local)
+          ('local  'all)
+          ('all    'global)))
+  (message "Csound cycle scope: %s" (upcase (symbol-name csound-cycle-scope)))
+  (force-mode-line-update t))
+
 ;; --- MINOR MODE ---
 (define-minor-mode csound-mode
   " compoooosing "
   :init-value nil
-  :lighter " csound"
-  :keymap csound-mode-map  ; Explicitly point to our base map
+  :lighter csound-mode-lighter  ; Pass the variable symbol directly here
+  :keymap csound-mode-map       ; Explicitly point to our base map
   (if csound-mode
       (progn
         (modify-syntax-entry ?\. "w" (syntax-table))
@@ -1083,6 +1197,12 @@ Typical keymap usage:
       (modify-syntax-entry ?\. "." (syntax-table))
       (visual-line-mode 1)
       (setq truncate-lines nil))))
+
+;; 3. FAILSAFE: Forcefully update Emacs' internal alist for the active session
+(let ((cell (assq 'csound-mode minor-mode-alist)))
+  (if cell
+      (setcdr cell '(csound-mode-lighter))
+    (push '(csound-mode csound-mode-lighter) minor-mode-alist)))
 
 (defun csound-toggle-layout ()
   "Manually toggle csound-mode shortcuts between Engram and QWERTY."
@@ -1111,3 +1231,5 @@ Typical keymap usage:
 
 ;; Associate .sco files with this new major mode
 (add-to-list 'auto-mode-alist '("\\.sco\\'" . csound-score-mode))
+
+(provide 'csound-score)
