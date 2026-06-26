@@ -10,7 +10,7 @@ a 0 0 0
 
 which are ignored from 'harvest (function that grab values from p-fields)
 <br><br><br>
-you can set the default layout at `customize-group`, as well the path the information of p-fields will be! `C-c I` edit this file and `C-q` quits and save it - if you `C-c i` with your cursor at a p-field, it will message the text set. 1° line is the instrument ID, 2° line start, 3° duration etc., each paragraph is a new definition of an instrument
+you can set the default layout at `customize-group`, as well the path for the file that stores information of p-fields! `C-c I` edit this file and `C-q` quits and save it - if you `C-c i` with your cursor at a p-field, it will message the text set. 1° line is the instrument ID, 2° line start, 3° duration etc., each paragraph is a new definition of an instrument
 <br><br><br>
 `csound-recalculate-starts` (set to CTRL+SHIFT+TAB) will either grab a selection or it will grab the line the cursor is as the anchor for calculations, till the end of the paragraph! it accounts for custom and native macros but will only adjust numeric values
 
@@ -28,7 +28,7 @@ i5 +  5
 i5 25 5
 ```
 <br><br>
-we have 2 custom macros, `++N` `+-N`, which acts like an ordinary `+` and a sum/subtraction of a value (N)! better than `^+N` as we also need to account the duration of the last note if we want to overlap it by any value. in case you need to check the file output, the mode parses it into `/tmp` and runs Csound from there
+we have 2 custom macros, `++N` `+-N`, which acts like an ordinary `+` and a sum/subtraction of a value (N)! better than `^+N` as it requires one to account the duration of the last note if we want to overlap it by any value. in case you need to check the file output, the mode parses it into `/tmp` and runs Csound from there
 <br><br><br>
 you can cyle between p-fields using SHIFT+TAB or TAB
 <br><br><br>
