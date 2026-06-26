@@ -1049,6 +1049,32 @@ LOCAL-ONLY   — 1 to force local, 0 to force global (current inst), 2 to force 
     (goto-char cursor-marker)
     (set-marker cursor-marker nil)))
 
+(defun csound-cycle-current-column (direction decimal-only &optional local-only)
+  "Detect the column under the cursor and cycle it using `csound-cycle-column`.
+DIRECTION is +1 or -1. DECIMAL-ONLY is 1 (yes) or 0 (no).
+LOCAL-ONLY is optional (1 for local, 2 for all, 0 for global)."
+  (let* ((line-beg (line-beginning-position))
+         (orig-point (point))
+         (found-idx nil)
+         (line-text (buffer-substring-no-properties line-beg (line-end-position))))
+
+    ;; 1. Calculate which column index the cursor is currently inside
+    (save-excursion
+      (beginning-of-line)
+      (let ((start 0) (idx 0))
+        (while (string-match "\\[[^]]+\\]\\|\\S-+" line-text start)
+          (let ((m-beg (+ line-beg (match-beginning 0)))
+                (m-end (+ line-beg (match-end 0))))
+            (when (and (>= orig-point m-beg) (<= orig-point m-end))
+              (setq found-idx idx)))
+          (setq start (match-end 0) idx (1+ idx)))))
+
+    ;; 2. Default to column 0 if we are somehow outside a token
+    (unless found-idx (setq found-idx 0))
+
+    ;; 3. Execute the standard cycle with the dynamic index
+    (csound-cycle-column found-idx direction decimal-only local-only)))
+
 (defvar csound-active-layout 'engram
   "The current manual keyboard layout for csound-mode ('engram or 'qwerty).")
 
@@ -1080,6 +1106,8 @@ LOCAL-ONLY   — 1 to force local, 0 to force global (current inst), 2 to force 
     (define-key map (kbd "C-N")         #'csound-custom-duplicate-repeat)
 
     (define-key map (kbd "Q")           #'csound-header-edit)
+    (define-key map (kbd "C-c i")       #'csound-show-column-info)
+    (define-key map (kbd "C-c I")       #'csound-edit-column-info)
     (define-key map (kbd "M-q") (lambda () (interactive) (insert "1.02197503906")))
 
     ;; p-field cycle ;;
@@ -1089,6 +1117,18 @@ LOCAL-ONLY   — 1 to force local, 0 to force global (current inst), 2 to force 
     (define-key map (kbd "=") (lambda () (interactive) (csound-cycle-column 4 -1 1)))
     (define-key map (kbd "+") (lambda () (interactive) (csound-cycle-column 4  1 1 1))) ; note local
     (define-key map (kbd "$") (lambda () (interactive) (csound-cycle-column 4 -1 1 1)))
+
+    ;; Dynamic column cycling (Column Agnostic)
+    ;; Full-field cycling (+1 / -1)
+    ;;(define-key map (kbd "C-c >") (lambda () (interactive) (csound-cycle-current-column  1 0)))
+    ;;(define-key map (kbd "C-c <") (lambda () (interactive) (csound-cycle-current-column -1 0)))
+    ;; Decimal-only cycling (+1 / -1)
+    ;;(define-key map (kbd "C-c .") (lambda () (interactive) (csound-cycle-current-column  1 1)))
+    ;;(define-key map (kbd "C-c ,") (lambda () (interactive) (csound-cycle-current-column -1 1)))
+    ;; Force-local dynamic cycling
+    ;;(define-key map (kbd "C-c }") (lambda () (interactive) (csound-cycle-current-column  1 0 1)))
+    ;;(define-key map (kbd "C-c {") (lambda () (interactive) (csound-cycle-current-column -1 0 1)))
+
     map)
   "Engram-specific shortcuts for csound-mode.")
 
@@ -1180,6 +1220,88 @@ LOCAL-ONLY   — 1 to force local, 0 to force global (current inst), 2 to force 
           ('all    'global)))
   (message "Csound cycle scope: %s" (upcase (symbol-name csound-cycle-scope)))
   (force-mode-line-update t))
+
+;; --- INSTRUMENT COLUMN DEFINITIONS ---
+
+(defvar csound-instrument-info-alist nil
+  "Alist storing instrument column definitions.
+Format: ((12 . (\"column 0 info\" \"column 1 info\")) ...)")
+
+(defun csound-parse-instrument-info ()
+  "Parse the *Csound Col Info* buffer and update `csound-instrument-info-alist`."
+  (interactive)
+  (setq csound-instrument-info-alist nil)
+  (save-excursion
+    (with-current-buffer "*Csound Col Info*"
+      (goto-char (point-min))
+      (while (not (eobp))
+        ;; Skip to the start of the next paragraph
+        (skip-chars-forward " \t\n")
+        (unless (eobp)
+          (let* ((para-end (save-excursion (forward-paragraph) (point)))
+                 (para-text (buffer-substring-no-properties (point) para-end))
+                 ;; Split by newline, dropping empty lines
+                 (lines (split-string para-text "\n" t)))
+            (when lines
+              (let ((first-line (car lines))
+                    (info-lines (cdr lines)))
+                ;; Look for i[number] or I[number]
+                (when (string-match "^[iI]\\s-*\\([0-9]+\\)" (string-trim first-line))
+                  (let ((inst-id (string-to-number (match-string 1 (string-trim first-line)))))
+                    (push (cons inst-id info-lines) csound-instrument-info-alist)))))
+            (goto-char para-end))))))
+  (message "Instrument column definitions updated!"))
+
+(defun csound-edit-column-info ()
+  "Open a buffer to define instrument column information.
+Press C-q to save the definitions and close."
+  (interactive)
+  (switch-to-buffer "*Csound Col Info*")
+  (text-mode)
+  ;; Insert a helpful header if the buffer is empty
+  (when (= (point-min) (point-max))
+    (insert ";; Define instrument columns here.\n")
+    (insert ";; Separate instruments with a blank line.\n")
+    (insert ";; Press C-c C-c to save and exit.\n\n")
+    (insert "i12\ntext for col 0 (p1)\ntext for col 1 (p2)\n\n"))
+  (local-set-key (kbd "C-q") (lambda ()
+                                   (interactive)
+                                   (csound-parse-instrument-info)
+                                   (quit-window))))
+
+(defun csound-show-column-info ()
+  "Identify the instrument and column at point, and display its definition."
+  (interactive)
+  (let* ((line-beg (line-beginning-position))
+         (orig-point (point))
+         (found-idx nil)
+         (line-text (buffer-substring-no-properties line-beg (line-end-position)))
+         (fields (csound-split-line line-text)))
+
+    ;; 1. Find which column index the cursor is currently inside
+    (save-excursion
+      (beginning-of-line)
+      (let ((start 0) (idx 0))
+        (while (string-match "\\[[^]]+\\]\\|\\S-+" line-text start)
+          (let ((m-beg (+ line-beg (match-beginning 0)))
+                (m-end (+ line-beg (match-end 0))))
+            (when (and (>= orig-point m-beg) (<= orig-point m-end))
+              (setq found-idx idx)))
+          (setq start (match-end 0) idx (1+ idx)))))
+
+    ;; Default to column 0 if we are somehow outside a token but on the line
+    (unless found-idx (setq found-idx 0))
+
+    ;; 2. Extract instrument ID and look it up
+    (let* ((inst-str (csound--extract-inst-id (nth 0 fields)))
+           (inst-id (when inst-str (string-to-number inst-str))))
+      (if (not inst-id)
+          (message "No instrument detected on this line.")
+        (let* ((inst-info (alist-get inst-id csound-instrument-info-alist))
+               (col-desc (nth found-idx inst-info)))
+          (if col-desc
+              (message "[Inst %d / Col %d]: %s" inst-id found-idx col-desc)
+            (message "[Inst %d / Col %d]: No definition provided." inst-id found-idx)))))))
 
 ;; --- MINOR MODE ---
 (define-minor-mode csound-mode
