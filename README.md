@@ -70,4 +70,4 @@ will start playing the score from 37.96, doesn't matter where your cursor is
 <br><br><br>
 `csound-smart-duplicate` will create a new line with the `p2` value by the previous line `p2 + p3`, `csound-custom-duplicate` asks for a number to sum from the previous line's `p2`
 <br><br><br>
-guess that's it. check my ENGRAM layout (https://github.com/binarybottle/engram) shortcuts for anything else (guess the rest is self explanatory)... there are `csound-vega-XXXXXX` functions which will require: https://altair-viz.github.io/ and they will render some chart visualization of the current score! it's a WIP, you can check an output at: https://happort.org/temp
+guess that's it. check my ENGRAM layout (thanks Arno https://github.com/binarybottle/engram) shortcuts for anything else (guess the rest is self explanatory)... there are `csound-vega-XXXXXX` functions which will require: https://altair-viz.github.io/ and they will render some chart visualization of the current score! it's a WIP, you can check an output at: https://happort.org/temp
