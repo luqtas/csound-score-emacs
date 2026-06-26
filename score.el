@@ -1075,8 +1075,44 @@ LOCAL-ONLY is optional (1 for local, 2 for all, 0 for global)."
     ;; 3. Execute the standard cycle with the dynamic index
     (csound-cycle-column found-idx direction decimal-only local-only)))
 
-(defvar csound-active-layout 'engram
-  "The current manual keyboard layout for csound-mode ('engram or 'qwerty).")
+;; --- CUSTOMIZATION & LAYOUT CONFIGURATION ---
+
+(defgroup csound nil
+  "Customization group for csound-mode."
+  :group 'languages)
+
+(defvar csound-layouts-alist
+  '((engram . csound-engram-map)
+    (qwerty . csound-qwerty-map))
+  "Alist mapping layout names to their respective keymap variables.
+To add a new layout, define a keymap (e.g., `csound-colemak-map`)
+and add `(colemak . csound-colemak-map)` to this list.")
+
+(defcustom csound-active-layout 'engram
+  "The default keyboard layout for csound-mode.
+Change this via M-x customize-group -> csound for a persistent save."
+  :type '(choice (const :tag "Engram" engram)
+                 (const :tag "QWERTY" qwerty)
+                 (symbol :tag "Custom Layout"))
+  :set (lambda (symbol value)
+         (set-default symbol value)
+         ;; Dynamically update the active keymap if the mode is already loaded
+         (when (and (boundp 'csound-mode-map) csound-mode-map)
+           (let ((map-sym (alist-get value csound-layouts-alist)))
+             (when (and map-sym (boundp map-sym))
+               (set-keymap-parent csound-mode-map (symbol-value map-sym))))))
+  :group 'csound)
+
+(defcustom csound-instrument-info-file
+  (expand-file-name "csound-instruments.el" user-emacs-directory)
+  "File path to save and load persistent Csound instrument definitions."
+  :type 'file
+  :set (lambda (symbol value)
+         (set-default symbol value)
+         ;; If the loading function is available, run it immediately on path change
+         (when (fboundp 'csound-load-instrument-info)
+           (csound-load-instrument-info)))
+  :group 'csound)
 
 ;; --- ENGRAM LAYER ---
 
@@ -1192,8 +1228,11 @@ LOCAL-ONLY is optional (1 for local, 2 for all, 0 for global)."
     (define-key map (kbd "C-c b") (lambda () (interactive) (insert "; 3044eb's violin\n\n;11 STR DUR AMP NOTE PRES RAT STR VIBF END VAMP EDO REPEAT BASE")))
     (define-key map (kbd "C-c y") (lambda () (interactive) (insert "; 9e9b00's vibraphone\n\n;10 STR DUR AMP NOTE HRD POS STR VIBF END EDO REPEAT BASE")))
 
-    ;; Set the initial parent to Engram
-    (set-keymap-parent map csound-engram-map)
+    ;; Set the initial parent based on the user's saved customize option
+    (let ((default-map (alist-get csound-active-layout csound-layouts-alist)))
+      (if (and default-map (boundp default-map))
+          (set-keymap-parent map (symbol-value default-map))
+        (set-keymap-parent map csound-engram-map))) ;; Fallback
     map)
   "Base keymap for csound-mode. Inherits from active layout.")
 
@@ -1227,8 +1266,31 @@ LOCAL-ONLY is optional (1 for local, 2 for all, 0 for global)."
   "Alist storing instrument column definitions.
 Format: ((12 . (\"column 0 info\" \"column 1 info\")) ...)")
 
+(require 'pp)
+
+(defun csound-save-instrument-info ()
+  "Save `csound-instrument-info-alist` to the file specified by `csound-instrument-info-file`."
+  (interactive)
+  (with-temp-file csound-instrument-info-file
+    (insert ";; Auto-generated Csound instrument definitions\n")
+    (insert ";; Saved automatically via C-q in the *Csound Col Info* buffer\n\n")
+    (insert "(setq csound-instrument-info-alist\n  '")
+    (pp csound-instrument-info-alist (current-buffer))
+    (insert ")\n"))
+  (message "Instrument definitions saved to %s" csound-instrument-info-file))
+
+(defun csound-load-instrument-info ()
+  "Load persistent instrument definitions from `csound-instrument-info-file`."
+  (interactive)
+  (if (file-exists-p csound-instrument-info-file)
+      (progn
+        (load-file csound-instrument-info-file)
+        (message "Loaded Csound instrument definitions."))
+    (message "No saved Csound instruments found at %s. A new file will be created on save."
+             csound-instrument-info-file)))
+
 (defun csound-parse-instrument-info ()
-  "Parse the *Csound Col Info* buffer and update `csound-instrument-info-alist`."
+  "Parse the *Csound Col Info* buffer, update the alist, and save to disk."
   (interactive)
   (setq csound-instrument-info-alist nil)
   (save-excursion
@@ -1250,20 +1312,35 @@ Format: ((12 . (\"column 0 info\" \"column 1 info\")) ...)")
                   (let ((inst-id (string-to-number (match-string 1 (string-trim first-line)))))
                     (push (cons inst-id info-lines) csound-instrument-info-alist)))))
             (goto-char para-end))))))
-  (message "Instrument column definitions updated!"))
+  ;; SAVE TO DISK
+  (csound-save-instrument-info))
 
 (defun csound-edit-column-info ()
   "Open a buffer to define instrument column information.
-Press C-q to save the definitions and close."
+If definitions already exist in memory, populate the buffer with them."
   (interactive)
   (switch-to-buffer "*Csound Col Info*")
   (text-mode)
-  ;; Insert a helpful header if the buffer is empty
+
+  ;; If the buffer is completely fresh/empty, populate it
   (when (= (point-min) (point-max))
-    (insert ";; Define instrument columns here.\n")
-    (insert ";; Separate instruments with a blank line.\n")
-    (insert ";; Press C-c C-c to save and exit.\n\n")
-    (insert "i12\ntext for col 0 (p1)\ntext for col 1 (p2)\n\n"))
+    (if csound-instrument-info-alist
+        (progn
+          (insert ";; Current instrument definitions. Edit and press C-q to save.\n\n")
+          ;; Reverse because alist pushing flips the order
+          (dolist (item (reverse csound-instrument-info-alist))
+            (let ((inst-id (car item))
+                  (lines (cdr item)))
+              (insert (format "i%d\n" inst-id))
+              (dolist (line lines)
+                (insert line "\n"))
+              (insert "\n"))))
+      ;; Fallback placeholder template if absolutely no data exists yet
+      (insert ";; Define instrument columns here.\n")
+      (insert ";; Separate instruments with a blank line.\n")
+      (insert ";; Press C-q to save and exit.\n\n")
+      (insert "i12\ntext for col 0 (p1)\ntext for col 1 (p2)\n\n")))
+
   (local-set-key (kbd "C-q") (lambda ()
                                    (interactive)
                                    (csound-parse-instrument-info)
@@ -1326,21 +1403,29 @@ Press C-q to save the definitions and close."
       (setcdr cell '(csound-mode-lighter))
     (push '(csound-mode csound-mode-lighter) minor-mode-alist)))
 
-(defun csound-toggle-layout ()
-  "Manually toggle csound-mode shortcuts between Engram and QWERTY."
-  (interactive)
-  (if (eq csound-active-layout 'engram)
-      (progn
-        (setq csound-active-layout 'qwerty)
-        (set-keymap-parent csound-mode-map csound-qwerty-map)
-        (message "Keyboard Layout: QWERTY"))
-    (progn
-      (setq csound-active-layout 'engram)
-      (set-keymap-parent csound-mode-map csound-engram-map)
-      (message "Keyboard Layout: ENGRAM"))))
+(defun csound-set-layout (layout-name)
+  "Set the active layout for csound-mode to LAYOUT-NAME."
+  (interactive
+   (list (intern (completing-read "Choose layout: " (mapcar #'car csound-layouts-alist) nil t))))
+  (let ((map-sym (alist-get layout-name csound-layouts-alist)))
+    (if (and map-sym (boundp map-sym))
+        (progn
+          ;; Updates the variable and triggers the :set lambda
+          (customize-set-variable 'csound-active-layout layout-name)
+          (message "Keyboard Layout set to: %s" (upcase (symbol-name layout-name))))
+      (error "Layout '%s' or its keymap is not defined." layout-name))))
 
-;; Optional: Bind the toggle to a global key so you can hit it anytime
-;; (global-set-key (kbd "C-c l") 'csound-toggle-layout)
+(defun csound-cycle-layout ()
+  "Cycle through all available layouts defined in `csound-layouts-alist`."
+  (interactive)
+  (let* ((keys (mapcar #'car csound-layouts-alist))
+         (current-pos (cl-position csound-active-layout keys))
+         (next-pos (if current-pos (mod (1+ current-pos) (length keys)) 0))
+         (next-layout (nth next-pos keys)))
+    (csound-set-layout next-layout)))
+
+;; Optional: Bind the cycle to a global key so you can hit it anytime
+;; (global-set-key (kbd "C-c l") 'csound-cycle-layout)
 
 ;; gotta change this to text-mode only!
 (global-set-key (kbd "C-c t") 'csound-mode) ; global shortcut as we need to return from text-mode
@@ -1353,5 +1438,8 @@ Press C-q to save the definitions and close."
 
 ;; Associate .sco files with this new major mode
 (add-to-list 'auto-mode-alist '("\\.sco\\'" . csound-score-mode))
+
+;; Load saved instrument definitions when the package initializes
+(csound-load-instrument-info)
 
 (provide 'csound-score)
