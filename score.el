@@ -1083,7 +1083,8 @@ LOCAL-ONLY is optional (1 for local, 2 for all, 0 for global)."
 
 (defvar csound-layouts-alist
   '((engram . csound-engram-map)
-    (qwerty . csound-qwerty-map))
+    (qwerty . csound-qwerty-map)
+    (thumbkey . csound-thumbkey-map))
   "Alist mapping layout names to their respective keymap variables.
 To add a new layout, define a keymap (e.g., `csound-colemak-map`)
 and add `(colemak . csound-colemak-map)` to this list.")
@@ -1093,6 +1094,7 @@ and add `(colemak . csound-colemak-map)` to this list.")
 Change this via M-x customize-group -> csound for a persistent save."
   :type '(choice (const :tag "Engram" engram)
                  (const :tag "QWERTY" qwerty)
+                 (const :tag "THUMBKEY" thumbkey)
                  (symbol :tag "Custom Layout"))
   :set (lambda (symbol value)
          (set-default symbol value)
@@ -1114,13 +1116,35 @@ Change this via M-x customize-group -> csound for a persistent save."
            (csound-load-instrument-info)))
   :group 'csound)
 
-;; --- ENGRAM LAYER ---
+;; THUMB-KEY LAYOUT
+;;
+;;       ` ^
+;;   s   + r ! ? o
+;; $   w / g \ u =
+;; {   % j q b |   }
+;; ( n m k h p l a )
+;; [   _ v x y @   ]
+;; ~   c " f ' d &
+;;   t   , i z # e
+;; <   : * . - ;   >
+;;
+;;-----------------
+;;
+;;       ` ^
+;;   1   + 2 ! ? 3
+;; $   w / g \ u =
+;; {   % j q b |   }
+;; ( 4 m k 5 p l 6 )
+;; [   _ v x y @   ]
+;; ~   c " f ' d &
+;;   7   , 8   # 9
+;; <   : * . - ;   >
+;;     0
 
-;; > b y o u '    ( d n g v q
-;; 0 1 2 3 4 ,    . 5 6 7 8 9
-;; ~ ^ # * & -    ? @ = + $ /
+;; guess instead of S-TAB & TAB for p-field navigation
+;; '(' and ')'
 
-(defvar csound-engram-map
+(defvar csound-thumbkey-map
   (let ((map (make-sparse-keymap)))
     ;; general shortcuts ;;
     (define-key map (kbd "u")           #'csound-start)
@@ -1136,7 +1160,7 @@ Change this via M-x customize-group -> csound for a persistent save."
 
     (define-key map (kbd "M-.")         #'csound-toggle-cycle-scope)
 
-    (define-key map (kbd "d")           #'duplicate-line)
+    (define-key map (kbd "s")           #'duplicate-line)
     (define-key map (kbd "n")           #'csound-smart-duplicate)
     (define-key map (kbd "N")           #'csound-custom-duplicate)
     (define-key map (kbd "C-N")         #'csound-custom-duplicate-repeat)
@@ -1166,30 +1190,92 @@ Change this via M-x customize-group -> csound for a persistent save."
     ;;(define-key map (kbd "C-c {") (lambda () (interactive) (csound-cycle-current-column -1 0 1)))
 
     map)
+  "thumb-key specific shortcuts for csound-mode.")
+
+
+;; ENGRAM LAYOUT
+;;
+;; > b y o u '    ( d n g v q
+;; 0 1 2 3 4 ,    . 5 6 7 8 9
+;; ~ ^ # * & -    ? @ = + $ /
+
+(defvar csound-engram-map
+  (let ((map (make-sparse-keymap)))
+    ;; general shortcuts ;;
+    (define-key map (kbd "u")           #'csound-start)
+    (define-key map (kbd "U")           #'csound-stop-and-log)
+    (define-key map (kbd "M-u")         #'csound-stop-and-track)
+    (define-key map (kbd "C-c u w")     #'csound-record-wav)
+    (define-key map (kbd "C-c u o")     #'csound-record-ogg)
+    (define-key map (kbd "o")           #'play-from-value)
+    (define-key map (kbd "y")           #'play-from-cursor)
+    (define-key map (kbd "b")           #'play-from-zero)
+    (define-key map (kbd "B")           #'play-from-point)
+    (define-key map (kbd "M-b")         #'print-start-value)
+
+    (define-key map (kbd "d")           #'duplicate-line)
+    (define-key map (kbd "n")           #'csound-smart-duplicate)
+    (define-key map (kbd "N")           #'csound-custom-duplicate)
+    (define-key map (kbd "C-N")         #'csound-custom-duplicate-repeat)
+
+    (define-key map (kbd "Q")           #'csound-header-edit)
+    (define-key map (kbd "C-c i")       #'csound-show-column-info)
+    (define-key map (kbd "C-c I")       #'csound-edit-column-info)
+    (define-key map (kbd "M-q") (lambda () (interactive) (insert "1.02197503906")))
+
+    ;; p-field cycle ;;
+    (define-key map (kbd "M-.")         #'csound-toggle-cycle-scope)
+
+    (define-key map (kbd "*") (lambda () (interactive) (csound-cycle-column 2  1 0))) ; dur
+    (define-key map (kbd "&") (lambda () (interactive) (csound-cycle-column 2 -1 0)))
+    (define-key map (kbd "@") (lambda () (interactive) (csound-cycle-column 4  1 1))) ; note global
+    (define-key map (kbd "=") (lambda () (interactive) (csound-cycle-column 4 -1 1)))
+    (define-key map (kbd "+") (lambda () (interactive) (csound-cycle-column 4  1 1 1))) ; note local
+    (define-key map (kbd "$") (lambda () (interactive) (csound-cycle-column 4 -1 1 1)))
+
+    ;; Dynamic column cycling (Column Agnostic)
+    ;; Full-field cycling (+1 / -1)
+    ;;(define-key map (kbd "C-c >") (lambda () (interactive) (csound-cycle-current-column  1 0)))
+    ;;(define-key map (kbd "C-c <") (lambda () (interactive) (csound-cycle-current-column -1 0)))
+    ;; Decimal-only cycling (+1 / -1)
+    ;;(define-key map (kbd "C-c .") (lambda () (interactive) (csound-cycle-current-column  1 1)))
+    ;;(define-key map (kbd "C-c ,") (lambda () (interactive) (csound-cycle-current-column -1 1)))
+    ;; Force-local dynamic cycling
+    ;;(define-key map (kbd "C-c }") (lambda () (interactive) (csound-cycle-current-column  1 0 1)))
+    ;;(define-key map (kbd "C-c {") (lambda () (interactive) (csound-cycle-current-column -1 0 1)))
+
+    map)
   "Engram-specific shortcuts for csound-mode.")
 
 ;; --- QWERTY LAYER ---
 (defvar csound-qwerty-map
   (let ((map (make-sparse-keymap)))
     ;; general shortcuts ;;
-    (define-key map (kbd "f") #'csound-start)
-    (define-key map (kbd "F") #'csound-stop-and-log)
-    (define-key map (kbd "M-f") #'csound-stop-and-track)
-    (define-key map (kbd "C-c f w") #'csound-record-wav)
-    (define-key map (kbd "C-c f o") #'csound-record-ogg)
-    (define-key map (kbd "d") #'duplicate-line)
-    (define-key map (kbd "s") #'csound-smart-duplicate)
-    (define-key map (kbd "S") #'csound-custom-duplicate)
-    (define-key map (kbd "C-S") #'csound-custom-duplicate-repeat)
-    (define-key map (kbd "r") #'play-from-value)
-    (define-key map (kbd "e") #'which-play-value-modify)
-    (define-key map (kbd "E") #'which-play-value-show)
-    (define-key map (kbd "M-e") #'csound-show-macro-values)
-    (define-key map (kbd "w") #'play-from-zero)
-    (define-key map (kbd "Q") #'csound-header-edit)
-    (define-key map (kbd "A") (lambda () (interactive) (insert "1.02197503906")))
+
+    (define-key map (kbd "f")           #'csound-start)
+    (define-key map (kbd "F")           #'csound-stop-and-log)
+    (define-key map (kbd "M-f")         #'csound-stop-and-track)
+    (define-key map (kbd "C-c f w")     #'csound-record-wav)
+    (define-key map (kbd "C-c f o")     #'csound-record-ogg)
+    (define-key map (kbd "d")           #'play-from-cursor)
+    (define-key map (kbd "s")           #'play-from-value)
+    (define-key map (kbd "a")           #'play-from-zero)
+    (define-key map (kbd "A")           #'play-from-point)
+    (define-key map (kbd "M-a")         #'print-start-value)
+
+    (define-key map (kbd "r")           #'duplicate-line)
+    (define-key map (kbd "e")           #'csound-smart-duplicate)
+    (define-key map (kbd "w")           #'csound-custom-duplicate)
+    (define-key map (kbd "C-w")         #'csound-custom-duplicate-repeat)
+
+    (define-key map (kbd "C-c i")       #'csound-show-column-info)
+    (define-key map (kbd "C-c I")       #'csound-edit-column-info)
+    (define-key map (kbd "Q")           #'csound-header-edit)
+    (define-key map (kbd "M-q") (lambda () (interactive) (insert "1.02197503906")))
 
     ;; p-fields cycle ;;
+    (define-key map (kbd "M-.")         #'csound-toggle-cycle-scope)
+
     (define-key map (kbd "t") (lambda () (interactive) (csound-cycle-column 2  1 0))) ; dur p-field
     (define-key map (kbd "y") (lambda () (interactive) (csound-cycle-column 2 -1 0)))
     (define-key map (kbd "g") (lambda () (interactive) (csound-cycle-column 3  1 0))) ; amp p-field
