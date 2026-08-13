@@ -117,13 +117,12 @@ With a prefix argument SHOW-BUFFER (e.g., C-u), display the output window."
 
 (defun csound--set-advance-start (value)
   "Edit the advance-statement line to use VALUE as the start time.
-Uses a silent search-forward — no isearch UI, no cursor flicker.
-Finds the line below the 'advance statement' comment and rewrites
-the fourth field (the start time) in place."
+Uses a silent re-search-forward to find the line starting with 'a 0 0'
+and rewrites the fourth field (the start time) in place."
   (save-mark-and-excursion
     (goto-char (point-min))
-    (when (search-forward "advance statement" nil t)
-      (forward-line 1)
+    (when (re-search-forward "^a\\s-+0\\s-+0" nil t)
+      ;; Removed (forward-line 1) since we are already on the correct line
       (let ((bol (line-beginning-position))
             (eol (line-end-position)))
         (replace-regexp-in-region
@@ -136,13 +135,12 @@ the fourth field (the start time) in place."
 Returns 0.0 if the line cannot be found or is malformed."
   (save-mark-and-excursion
     (goto-char (point-min))
-    (if (search-forward "advance statement" nil t)
-        (progn
-          (forward-line 1)
-          (let ((cols (split-string (thing-at-point 'line t) "[ \t]+" t)))
-            (if (>= (length cols) 4)
-                (string-to-number (nth 3 cols))
-              0.0)))
+    (if (re-search-forward "^a\\s-+0\\s-+0" nil t)
+        ;; Removed (forward-line 1) since point is already on the target line
+        (let ((cols (split-string (thing-at-point 'line t) "[ \t]+" t)))
+          (if (>= (length cols) 4)
+              (string-to-number (nth 3 cols))
+            0.0))
       0.0)))
 
 (defun play-from-cursor ()
@@ -253,14 +251,13 @@ Returns 0.0 if the line cannot be found or is malformed."
   (interactive)
   (save-excursion
     (goto-char (point-min))
-    (if (search-forward "; advance statement ;" nil t)
-        (progn
-          (forward-line 1)
-          (let ((cols (split-string (thing-at-point 'line t) "[ \t]+" t)))
-            (if (>= (length cols) 4)
-                (message "Advance statement value: %s" (nth 3 cols))
-              (error "The advance statement does not have 4 columns."))))
-      (error "Could not find '; advance statement ;' in the buffer."))))
+    (if (re-search-forward "^a\\s-+0\\s-+0" nil t)
+        ;; Removed (forward-line 1) since point is already on the target line
+        (let ((cols (split-string (thing-at-point 'line t) "[ \t]+" t)))
+          (if (>= (length cols) 4)
+              (message "Advance statement value: %s" (nth 3 cols))
+            (error "The advance statement does not have 4 columns.")))
+      (error "Could not find the 'a 0 0' statement in the buffer."))))
 
 (defun play-from-cursor ()
   "Modify the advance statement using column 2 of the CURRENT line and start Csound."
@@ -944,7 +941,7 @@ LOCAL-ONLY   — 1 to force local, 0 to force global (current inst), 2 to force 
          (scope (cond ((eq local-only 1) 'local)
                       ((eq local-only 2) 'all)
                       ((eq local-only 0) 'global)
-                      (t (if (boundp 'csound-cycle-scope) csound-cycle-scope 'global)))))
+                      (t (if (boundp 'csound-cycle-scope) csound-cycle-scope 'all)))))
 
     (if (not inst-id)
         (message "csound-cycle-column: Could not detect valid Instrument ID.")
@@ -1323,7 +1320,7 @@ Change this via M-x customize-group -> csound for a persistent save."
   "Base keymap for csound-mode. Inherits from active layout.")
 
 ;; 1. Upgrade variable from boolean to symbol
-(defvar-local csound-cycle-scope 'global
+(defvar-local csound-cycle-scope 'all
   "Current scope for `csound-cycle-column`. Can be 'global, 'local, or 'all.")
 
 ;; 2. Upgrade the lighter to check all 3 states
