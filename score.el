@@ -1,12 +1,38 @@
+;;; csound-score.el --- Csound score editing and playback mode -*- lexical-binding: t; -*-
+
 ;; next ask for a function that toggles + and ^ to numbers (save the ones that used it)
 ;; ... but we should be able to return it! maybe it's better to have a
 ;; print that tells their value instead of anything?
 
 (setq-default indent-tabs-mode nil) ; Global default: use spaces, never tabs
 (add-hook 'before-save-hook 'delete-trailing-whitespace)
+(require 'cl-lib)
+(require 'calc nil t)
 ;; we can cleanup the buffer with
 ;; M-x untabify
 ;; M-x delete-trailing-whitespace
+
+(defun csound--termux-or-android-p ()
+  "Return non-nil if running in Termux or on Android."
+  (or (featurep 'android)
+      (eq system-type 'android)
+      (getenv "TERMUX_VERSION")
+      (file-directory-p "/data/data/com.termux")
+      (string-match-p "com\\.termux" (or (getenv "PREFIX") ""))))
+
+(defcustom csound-header-path
+  (if (csound--termux-or-android-p)
+      "/root/storage/shared/cloud/csound/header.orc"
+    (expand-file-name "~/Desktop/projects/qob/Csound/header.orc"))
+  "Path to the master Csound orchestra header file."
+  :type 'file
+  :group 'csound)
+
+(defun csound--realtime-flags ()
+  "Return real-time audio flags appropriate for the current platform."
+  (if (csound--termux-or-android-p)
+      '("-+rtaudio=pulse" "-odac" "-b512" "-B2048")
+    '("-odac")))
 
 ;; playing a .csd file ;;
 (global-set-key (kbd "C-c p") 'play-csd)
@@ -30,7 +56,8 @@ With a prefix argument SHOW-BUFFER (e.g., C-u), display the output window."
       (csound-stop)
 
       (let* ((buf-name "*Csound Output*")
-             (proc (start-process "csound-process" buf-name "csound" "-odac" file-path)))
+             (args (append (csound--realtime-flags) (list file-path)))
+             (_proc (apply #'start-process "csound-process" buf-name "csound" args)))
         (message "Csound started for %s..." (file-name-nondirectory file-path))
         ;; 4. Handle the window display logic
         (if show-buffer
@@ -53,15 +80,22 @@ With a prefix argument SHOW-BUFFER (e.g., C-u), display the output window."
   (call-process "killall" nil nil nil "csound")
   (csound--cleanup-tempfile))
 
-(defun csound-start ()
-  (interactive)
+(defun csound-start (&optional show-buffer)
+  "Start Csound with the resolved score.
+With a prefix argument SHOW-BUFFER (e.g., C-u), display the *Csound Output* buffer."
+  (interactive "P")
   (csound-stop) ;; Snuff out the old instance
   (save-buffer)
-  (let ((score-file (csound--create-resolved-tempfile)))
-    (call-process "csound" nil 0 nil
-                  "-odac"
-                  "/home/luqtas/Desktop/projects/qob/Csound/header.orc"
-                  score-file))
+  (let* ((score-file (csound--create-resolved-tempfile))
+         (buf-name "*Csound Output*")
+         (args (append (csound--realtime-flags)
+                       (list csound-header-path
+                             score-file)))
+         (_proc (apply #'start-process "csound-process" buf-name "csound" args)))
+    (if show-buffer
+        (display-buffer buf-name)
+      (let ((win (get-buffer-window buf-name)))
+        (when win (delete-window win)))))
   (setq csound-start-time (float-time))
   (message "Csound started..."))
 
@@ -72,7 +106,7 @@ With a prefix argument SHOW-BUFFER (e.g., C-u), display the output window."
   (let ((score-file (csound--create-resolved-tempfile)))
     (call-process "csound" nil 0 nil
                   "-o" (file-name-with-extension buffer-file-name ".wav")
-                  "/home/luqtas/Desktop/projects/qob/Csound/header.orc"
+                  csound-header-path
                   score-file "-W")))
 
 (defun csound-record-ogg ()
@@ -83,8 +117,25 @@ With a prefix argument SHOW-BUFFER (e.g., C-u), display the output window."
     (call-process "csound" nil 0 nil
                   "-o" (file-name-with-extension buffer-file-name ".ogg")
                   "--ogg"
-                  "/home/luqtas/Desktop/projects/qob/Csound/header.orc"
+                  csound-header-path
                   score-file)))
+
+(defun csound--format-number (num)
+  "Convert NUM (a number or string) to a score string without premature rounding."
+  (cond
+   ((stringp num) num)
+   ((integerp num) (number-to-string num))
+   ((floatp num) (number-to-string num))
+   (t (format "%s" num))))
+
+(defconst csound-field-regex
+  "\\[[^]]+\\]\\|\\S-+"
+  "Regex matching any Csound score field token before inline comment.
+Keeps [...] bracket expressions together as a single token.")
+
+(defconst csound-number-regex csound-field-regex
+  "Regex matching any Csound score field: bracket expressions, numbers, and macros.
+Maintained for backwards compatibility; alias of `csound-field-regex`.")
 
 (defun csound-show-macro-values ()
   "Print the resolved numeric values of any macros on the current line."
@@ -95,15 +146,15 @@ With a prefix argument SHOW-BUFFER (e.g., C-u), display the output window."
     (save-excursion
       (beginning-of-line)
       ;; Step through every p-field on the line
-      (while (re-search-forward csound-number-regex code-end t)
+      (while (re-search-forward csound-field-regex code-end t)
         (setq col-idx (1+ col-idx))
         (let ((val-str (match-string 0)))
           ;; If it's a macro, resolve it and store the string
           (when (csound-is-macro-p val-str)
-            (push (format "p%d[%s] = %g"
+            (push (format "p%d[%s] = %s"
                           col-idx
                           val-str
-                          (csound--get-number-at-column col-idx))
+                          (csound--format-number (csound--get-number-at-column col-idx)))
                   results)))))
     ;; Display the results
     (if results
@@ -127,7 +178,7 @@ and rewrites the fourth field (the start time) in place."
             (eol (line-end-position)))
         (replace-regexp-in-region
          "\\(\\(?:\\S-+\\s-+\\)\\{3\\}\\).*$"
-         (concat "\\1" (format "%g" value))
+         (concat "\\1" (csound--format-number value))
          bol eol)))))
 
 (defun csound--get-advance-start ()
@@ -146,14 +197,13 @@ Returns 0.0 if the line cannot be found or is malformed."
 (defun play-from-cursor ()
   (interactive)
   ;; csound--get-number-at-column resolves ++N / +-N as well
-  (setq a (csound--get-number-at-column 2))
-  (csound--set-advance-start a)
-  (log-csound-start)
-  (csound-start))
+  (let ((a (csound--get-number-at-column 2)))
+    (csound--set-advance-start a)
+    (log-csound-start)
+    (csound-start)))
 
 (defun play-from-zero ()
   (interactive)
-  (setq a 0)
   (csound--set-advance-start 0)
   (log-csound-start)
   (csound-start))
@@ -162,46 +212,46 @@ Returns 0.0 if the line cannot be found or is malformed."
 (defun play-from-value ()
   (interactive)
   (setq play-from-value (read-string "Start Value (Number or Macro): "))
-  (setq a
-        (cond
-         ;; . or ^ → p2 of the line above
-         ((or (string= play-from-value ".") (string= play-from-value "^"))
-          (save-excursion
-            (if (= (forward-line -1) 0) (csound--get-number-at-column 2) 0.0)))
-         ;; + → end of the note on the line above (p2 + p3)
-         ((string= play-from-value "+")
-          (save-excursion
-            (if (= (forward-line -1) 0)
-                (+ (csound--get-number-at-column 2)
-                   (csound--get-number-at-column 3))
-              0.0)))
-         ;; ^+N / ^-N → p2 of line above ± N
-         ((string-match "^\\^\\([-+]\\)\\([0-9]+\\.[0-9]*\\|\\.[0-9]+\\|[0-9]+\\)$"
-                        play-from-value)
-          (let ((sign (match-string 1 play-from-value))
-                (num  (string-to-number (match-string 2 play-from-value))))
-            (save-excursion
-              (if (= (forward-line -1) 0)
-                  (if (string= sign "+")
-                      (+ (csound--get-number-at-column 2) num)
-                    (- (csound--get-number-at-column 2) num))
-                0.0))))
-         ;; ++N / +-N → (p2 + p3) of line above ± N
-         ((string-match "^\\+\\([-+]\\)\\([0-9]+\\.[0-9]*\\|\\.[0-9]+\\|[0-9]+\\)$"
-                        play-from-value)
-          (let ((sign (match-string 1 play-from-value))
-                (num  (string-to-number (match-string 2 play-from-value))))
-            (save-excursion
-              (if (= (forward-line -1) 0)
-                  (let ((base (+ (csound--get-number-at-column 2)
-                                 (csound--get-number-at-column 3))))
-                    (if (string= sign "+") (+ base num) (- base num)))
-                0.0))))
-         ;; Plain number
-         (t (string-to-number play-from-value))))
-  (csound--set-advance-start a)
-  (log-csound-start)
-  (csound-start))
+  (let ((a
+         (cond
+          ;; . or ^ → p2 of the line above
+          ((or (string= play-from-value ".") (string= play-from-value "^"))
+           (save-excursion
+             (if (= (forward-line -1) 0) (csound--get-number-at-column 2) 0.0)))
+          ;; + → end of the note on the line above (p2 + p3)
+          ((string= play-from-value "+")
+           (save-excursion
+             (if (= (forward-line -1) 0)
+                 (+ (csound--get-number-at-column 2)
+                    (csound--get-number-at-column 3))
+               0.0)))
+          ;; ^+N / ^-N → p2 of line above ± N
+          ((string-match "^\\^\\([-+]\\)\\([0-9]+\\.[0-9]*\\|\\.[0-9]+\\|[0-9]+\\)$"
+                         play-from-value)
+           (let ((sign (match-string 1 play-from-value))
+                 (num  (string-to-number (match-string 2 play-from-value))))
+             (save-excursion
+               (if (= (forward-line -1) 0)
+                   (if (string= sign "+")
+                       (+ (csound--get-number-at-column 2) num)
+                     (- (csound--get-number-at-column 2) num))
+                 0.0))))
+          ;; ++N / +-N → (p2 + p3) of line above ± N
+          ((string-match "^\\+\\([-+]\\)\\([0-9]+\\.[0-9]*\\|\\.[0-9]+\\|[0-9]+\\)$"
+                         play-from-value)
+           (let ((sign (match-string 1 play-from-value))
+                 (num  (string-to-number (match-string 2 play-from-value))))
+             (save-excursion
+               (if (= (forward-line -1) 0)
+                   (let ((base (+ (csound--get-number-at-column 2)
+                                  (csound--get-number-at-column 3))))
+                     (if (string= sign "+") (+ base num) (- base num)))
+                 0.0))))
+          ;; Plain number
+          (t (string-to-number play-from-value)))))
+    (csound--set-advance-start a)
+    (log-csound-start)
+    (csound-start)))
 
 (defun csound-stop-and-log ()
   "Stops the Csound process, calculates elapsed time, and resets the timer."
@@ -292,7 +342,7 @@ Returns 0.0 if the line cannot be found or is malformed."
 
 (defun csound-header-edit ()
   (interactive)
-  (find-file "/home/luqtas/Desktop/projects/qob/Csound/header.orc"))
+  (find-file csound-header-path))
 
 ;; GEMININI STUFF ;;
 (defun csound-score-align-region (beg end)
@@ -451,30 +501,6 @@ Returns the buffer position of the line, or nil if none match."
           (1- (point))
         eol))))
 
-;; The canonical regex for any Csound score "value" field.
-;; Alternatives are ordered from most-specific to least-specific so the
-;; engine greedily picks the right one:
-;;   1. ++N / +-N  (end-of-note offset macro)   [NEW]
-;;   2. ^+N / ^-N  (same-column offset macro)
-;;   3. float / int with optional leading sign
-;;   4. standalone . ^ +  (carry macros)
-(defconst csound-number-regex
-  (concat "\\(?:"
-          ;; 1. ++N or +-N  — note: \\+[+-] matches exactly two chars ++ or +-
-          "\\+[+-]\\(?:[0-9]+\\.[0-9]*\\|\\.[0-9]+\\|[0-9]+\\)"
-          "\\|"
-          ;; 2. ^+N or ^-N
-          "\\^[-+]\\(?:[0-9]+\\.[0-9]*\\|\\.[0-9]+\\|[0-9]+\\)"
-          "\\|"
-          ;; 3. plain number, optional sign
-          "-?[0-9]+\\.[0-9]*\\|-?\\.[0-9]+\\|-?[0-9]+"
-          "\\|"
-          ;; 4. standalone carry macros
-          "[+.^]"
-          "\\)")
-  "Regex matching any Csound score value: numbers and all carry/offset macros.
-Covers ++N, +-N, ^+N, ^-N, +, ., ^, signed/unsigned floats and ints.")
-
 (defun csound-is-macro-p (val-str)
   "Returns t if VAL-STR is a Csound carry or offset macro.
 Recognized: '.' '^' '+' '^+N' '^-N' '++N' '+-N'."
@@ -484,6 +510,18 @@ Recognized: '.' '^' '+' '^+N' '^-N' '++N' '+-N'."
       (string-match-p "^\\^[-+]" val-str)   ; ^+N / ^-N
       (string-match-p "^\\+[+-]" val-str))) ; ++N / +-N  [NEW]
 
+(defun csound-split-line (line)
+  "Split a Csound score line, keeping [...] expressions together. Ignores inline comments."
+  (let* ((code-only (if (string-match ";" line)
+                        (substring line 0 (match-beginning 0))
+                      line))
+         (fields '())
+         (start 0))
+    (while (string-match csound-field-regex code-only start)
+      (push (match-string 0 code-only) fields)
+      (setq start (match-end 0)))
+    (nreverse fields)))
+
 (defun csound-get-nth-val-string (n)
   "Find the Nth field on the current line and return its raw string."
   (save-excursion
@@ -491,7 +529,7 @@ Recognized: '.' '^' '+' '^+N' '^-N' '++N' '+-N'."
     (let ((found nil)
           (code-end (csound--code-end-position)))
       (dotimes (_ n)
-        (setq found (re-search-forward csound-number-regex code-end t)))
+        (setq found (re-search-forward csound-field-regex code-end t)))
       (if found (match-string 0) nil))))
 
 (defun csound-replace-nth-val (n new-val)
@@ -501,7 +539,7 @@ Recognized: '.' '^' '+' '^+N' '^-N' '++N' '+-N'."
     (let ((found nil)
           (code-end (csound--code-end-position)))
       (dotimes (_ n)
-        (setq found (re-search-forward csound-number-regex code-end t)))
+        (setq found (re-search-forward csound-field-regex code-end t)))
       (when found
         (let ((beg     (match-beginning 0))
               (end     (match-end 0))
@@ -509,7 +547,7 @@ Recognized: '.' '^' '+' '^+N' '^-N' '++N' '+-N'."
           (unless (csound-is-macro-p val-str)
             (delete-region beg end)
             (goto-char beg)
-            (insert (format "%g" new-val))))))))
+            (insert (csound--format-number new-val))))))))
 
 (defun csound--prev-i-statement ()
   "Move point to the start of the nearest previous i-statement, skipping blank
@@ -529,17 +567,14 @@ Returns t if one was found, nil if we hit the top of the buffer."
 (defun csound--get-number-at-column (col-idx)
   "Get the resolved numeric value of the COL-IDX-th field on the current line."
   (save-excursion
-    (beginning-of-line)
-    (let ((val-str nil)
-          (count 0)
-          (keep-going t)
-          (code-end (csound--code-end-position)))
-      (while (and keep-going (< count col-idx))
-        (if (re-search-forward csound-number-regex code-end t)
-            (progn (setq val-str (match-string 0))
-                   (setq count (1+ count)))
-          (setq val-str nil
-                keep-going nil)))
+    (let* ((line (buffer-substring-no-properties
+                  (line-beginning-position)
+                  (csound--code-end-position)))
+           (fields (csound-split-line line))
+           (idx (1- col-idx))
+           (val-str (if (and (>= idx 0) (< idx (length fields)))
+                        (nth idx fields)
+                      nil)))
       (cond
        ((not val-str)
         (if (csound--prev-i-statement)
@@ -569,7 +604,43 @@ Returns t if one was found, nil if we hit the top of the buffer."
                              (csound--get-number-at-column 3))))
                 (if (string= sign "+") (+ base num) (- base num)))
             0.0)))
+       ((and (string-prefix-p "[" val-str) (string-suffix-p "]" val-str))
+        (let* ((inner (string-trim (substring val-str 1 -1))))
+          (condition-case nil
+              (string-to-number (calc-eval inner))
+            (error 0.0))))
+       ((string-match "^[iI]\\s-*\\([0-9.]+\\)" val-str)
+        (string-to-number (match-string 1 val-str)))
        (t (string-to-number val-str))))))
+
+(defun csound--get-val-string-at-column (col-idx)
+  "Get the resolved string value of the COL-IDX-th field on the current line.
+If the field is absent or a carry macro ('.' or '^'), it carries the string
+from the previous i-statement without converting to float or rounding.
+If the field is an arithmetic macro ('+', '^+N', '++N', etc.), it resolves
+the numeric expression."
+  (save-excursion
+    (let* ((line (buffer-substring-no-properties
+                  (line-beginning-position)
+                  (csound--code-end-position)))
+           (fields (csound-split-line line))
+           (idx (1- col-idx))
+           (val-str (if (and (>= idx 0) (< idx (length fields)))
+                        (nth idx fields)
+                      nil)))
+      (cond
+       ((not val-str)
+        (if (csound--prev-i-statement)
+            (csound--get-val-string-at-column col-idx)
+          "0"))
+       ((or (string= val-str ".") (string= val-str "^"))
+        (if (csound--prev-i-statement)
+            (csound--get-val-string-at-column col-idx)
+          "0"))
+       ((csound-is-macro-p val-str)
+        (csound--format-number (csound--get-number-at-column col-idx)))
+       (t
+        val-str)))))
 
 (defun csound--replace-number-at-column (col-idx new-val &optional force)
   "Replace the COL-IDX-th number on the current line with NEW-VAL."
@@ -578,7 +649,7 @@ Returns t if one was found, nil if we hit the top of the buffer."
     (let ((found nil)
           (code-end (csound--code-end-position)))
       (dotimes (_ col-idx)
-        (setq found (re-search-forward csound-number-regex code-end t)))
+        (setq found (re-search-forward csound-field-regex code-end t)))
       (when found
         (let ((beg     (match-beginning 0))
               (end     (match-end 0))
@@ -586,7 +657,7 @@ Returns t if one was found, nil if we hit the top of the buffer."
           (when (or force (not (csound-is-macro-p val-str)))
             (delete-region beg end)
             (goto-char beg)
-            (insert (format "%g" new-val))))))))
+            (insert (csound--format-number new-val))))))))
 
 ;; --- TEMP FILE RESOLUTION ---
 ;; Csound does not understand ++N / +-N (or any of the carry macros beyond
@@ -623,40 +694,40 @@ Blank lines, comment lines (starting with ';'), and non-i-statements are skipped
                (string-match-p "^[iI]" trimmed))
       (let (replacements
             (col-idx 0)
-            (code-end (csound--code-end-position))) ; <-- Hard limit added
+            (code-end (csound--code-end-position)))
         ;; Pass 1 — scan explicit macros on this line
         (save-excursion
           (beginning-of-line)
-          (while (re-search-forward csound-number-regex code-end t)
+          (while (re-search-forward csound-field-regex code-end t)
             (setq col-idx (1+ col-idx))
             (let* ((val-str (match-string 0))
                    (beg     (match-beginning 0))
                    (end     (match-end 0)))
               (when (csound-is-macro-p val-str)
-                (push (list beg end (csound--get-number-at-column col-idx))
+                (push (list beg end (csound--get-val-string-at-column col-idx))
                       replacements)))))
         ;; Pass 1b — find how many fields the previous i-statement has
         (let (appended)
           (save-excursion
             (when (csound--prev-i-statement)
-              (let ((prev-cols 0))
-                (save-excursion
-                  (beginning-of-line)
-                  (while (re-search-forward csound-number-regex (csound--code-end-position) t)
-                    (setq prev-cols (1+ prev-cols))))
+              (let ((prev-cols (length (csound-split-line
+                                        (buffer-substring-no-properties
+                                         (line-beginning-position)
+                                         (csound--code-end-position))))))
                 (when (> prev-cols col-idx)
                   (dotimes (k (- prev-cols col-idx))
                     (let* ((missing-col (+ col-idx k 1))
-                           (val (csound--get-number-at-column missing-col)))
-                      (push (format "%g" val) appended)))))))
+                           (val-str (csound--get-val-string-at-column missing-col)))
+                      (push val-str appended)))))))
           ;; Pass 2 — apply in-line replacements right-to-left
           (dolist (rep (sort replacements (lambda (a b) (> (car a) (car b)))))
             (delete-region (nth 0 rep) (nth 1 rep))
             (goto-char (nth 0 rep))
-            (insert (format "%g" (nth 2 rep))))
+            (insert (nth 2 rep)))
           ;; Append missing fields RIGHT BEFORE the comment
           (when appended
             (goto-char (csound--code-end-position))
+            (skip-chars-backward " \t")
             (dolist (v (nreverse appended))
               (insert " " v))))))))
 
@@ -710,18 +781,7 @@ The original buffer is NEVER modified.  Any previous temp file is deleted."
   (when (and (stringp p1) (string-match "^[iI]\\s-*\\([0-9]+\\)" p1))
     (match-string 1 p1)))
 
-;; 2. HELPER: The Smart Splitter
-(defun csound-split-line (line)
-  "Split a Csound score line, keeping [...] expressions together. Ignores inline comments."
-  (let* ((code-only (if (string-match ";" line)
-                        (substring line 0 (match-beginning 0))
-                      line))
-         (fields '())
-         (start 0))
-    (while (string-match "\\[[^]]+\\]\\|\\S-+" code-only start)
-      (push (match-string 0 code-only) fields)
-      (setq start (match-end 0)))
-    (nreverse fields)))
+;; 2. HELPER: The Smart Splitter (`csound-split-line' defined above)
 
 ;; 3. THE HARVEST (Global & Local)
 (defun csound--harvest-include-p (fields)
@@ -1355,6 +1415,7 @@ Format: ((12 . (\"column 0 info\" \"column 1 info\")) ...)")
   "Save `csound-instrument-info-alist` to the file specified by `csound-instrument-info-file`."
   (interactive)
   (with-temp-file csound-instrument-info-file
+    (insert ";;; -*- lexical-binding: t; -*-\n")
     (insert ";; Auto-generated Csound instrument definitions\n")
     (insert ";; Saved automatically via C-q in the *Csound Col Info* buffer\n\n")
     (insert "(setq csound-instrument-info-alist\n  '")
@@ -1526,3 +1587,4 @@ If definitions already exist in memory, populate the buffer with them."
 (csound-load-instrument-info)
 
 (provide 'csound-score)
+;;; csound-score.el ends here
