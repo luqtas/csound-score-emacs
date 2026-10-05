@@ -121,11 +121,11 @@ With a prefix argument SHOW-BUFFER (e.g., C-u), display the *Csound Output* buff
                   score-file)))
 
 (defun csound--format-number (num)
-  "Convert NUM (a number or string) to a score string without premature rounding."
+  "Convert NUM (a number or string) to a score string without floating-point artifacts."
   (cond
    ((stringp num) num)
    ((integerp num) (number-to-string num))
-   ((floatp num) (number-to-string num))
+   ((floatp num) (number-to-string (/ (round (* num 1e8)) 1e8)))
    (t (format "%s" num))))
 
 (defconst csound-field-regex
