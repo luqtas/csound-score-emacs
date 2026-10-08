@@ -20,13 +20,38 @@
       (file-directory-p "/data/data/com.termux")
       (string-match-p "com\\.termux" (or (getenv "PREFIX") ""))))
 
+(defun csound--default-directory ()
+  "Locate the active Csound directory across Android and Desktop environments."
+  (cond
+   ((csound--termux-or-android-p)
+    (or (cl-find-if #'file-directory-p
+                    '("/root/storage/shared/cloud/csound"
+                      "~/storage/shared/cloud/csound"
+                      "/sdcard/cloud/csound"))
+        "/root/storage/shared/cloud/csound"))
+   (t
+    (or (cl-find-if #'file-directory-p
+                    (list (expand-file-name "~/Desktop/projects/qob/Csound")
+                          (expand-file-name "~/Desktop/projects/qob/csound")
+                          (expand-file-name "~/cloud/csound")
+                          (expand-file-name "~/storage/shared/cloud/csound")))
+        (expand-file-name "~/Desktop/projects/qob/Csound")))))
+
 (defcustom csound-header-path
-  (if (csound--termux-or-android-p)
-      "/root/storage/shared/cloud/csound/header.orc"
-    (expand-file-name "~/Desktop/projects/qob/Csound/header.orc"))
+  (expand-file-name "header.orc" (csound--default-directory))
   "Path to the master Csound orchestra header file."
   :type 'file
   :group 'csound)
+
+(defun csound--env-flags ()
+  "Return Csound environment flags for include and sound sample directories."
+  (let ((dir (file-name-directory csound-header-path)))
+    (when (and dir (file-directory-p dir))
+      (let ((clean-dir (directory-file-name (expand-file-name dir))))
+        (setenv "INCDIR" clean-dir)
+        (setenv "SSDIR" clean-dir)
+        (list (format "--env:INCDIR=%s" clean-dir)
+              (format "--env:SSDIR=%s" clean-dir))))))
 
 (defun csound--realtime-flags ()
   "Return real-time audio flags appropriate for the current platform."
@@ -56,7 +81,7 @@ With a prefix argument SHOW-BUFFER (e.g., C-u), display the output window."
       (csound-stop)
 
       (let* ((buf-name "*Csound Output*")
-             (args (append (csound--realtime-flags) (list file-path)))
+             (args (append (csound--env-flags) (csound--realtime-flags) (list file-path)))
              (_proc (apply #'start-process "csound-process" buf-name "csound" args)))
         (message "Csound started for %s..." (file-name-nondirectory file-path))
         ;; 4. Handle the window display logic
@@ -88,7 +113,8 @@ With a prefix argument SHOW-BUFFER (e.g., C-u), display the *Csound Output* buff
   (save-buffer)
   (let* ((score-file (csound--create-resolved-tempfile))
          (buf-name "*Csound Output*")
-         (args (append (csound--realtime-flags)
+         (args (append (csound--env-flags)
+                       (csound--realtime-flags)
                        (list csound-header-path
                              score-file)))
          (_proc (apply #'start-process "csound-process" buf-name "csound" args)))
@@ -103,22 +129,24 @@ With a prefix argument SHOW-BUFFER (e.g., C-u), display the *Csound Output* buff
   (interactive)
   (csound-stop) ;; Snuff out the old instance
   (save-buffer)
-  (let ((score-file (csound--create-resolved-tempfile)))
-    (call-process "csound" nil 0 nil
-                  "-o" (file-name-with-extension buffer-file-name ".wav")
-                  csound-header-path
-                  score-file "-W")))
+  (let* ((score-file (csound--create-resolved-tempfile))
+         (args (append (csound--env-flags)
+                       (list "-o" (file-name-with-extension buffer-file-name ".wav")
+                             csound-header-path
+                             score-file "-W"))))
+    (apply #'call-process "csound" nil 0 nil args)))
 
 (defun csound-record-ogg ()
   (interactive)
   (csound-stop) ;; Snuff out the old instance
   (save-buffer)
-  (let ((score-file (csound--create-resolved-tempfile)))
-    (call-process "csound" nil 0 nil
-                  "-o" (file-name-with-extension buffer-file-name ".ogg")
-                  "--ogg"
-                  csound-header-path
-                  score-file)))
+  (let* ((score-file (csound--create-resolved-tempfile))
+         (args (append (csound--env-flags)
+                       (list "-o" (file-name-with-extension buffer-file-name ".ogg")
+                             "--ogg"
+                             csound-header-path
+                             score-file))))
+    (apply #'call-process "csound" nil 0 nil args)))
 
 (defun csound--format-number (num)
   "Convert NUM (a number or string) to a score string without floating-point artifacts."
@@ -821,19 +849,20 @@ The original buffer is NEVER modified.  Any previous temp file is deleted."
                                 (push val (alist-get idx inst-alist))
                                 (setf (alist-get inst-id my-inst-column-cycles) inst-alist)))
 
-                            ;; 2. Decimal Harvest (Keep raw)
+                            ;; 2. Decimal Harvest (Pad single-digit to 2 digits so "0" -> "00")
                             (when (string-match "\\.\\([0-9]+\\)" val)
                               (let* ((raw-dec (match-string 1 val))
+                                     (dec (if (= (length raw-dec) 1) (concat raw-dec "0") raw-dec))
                                      (inst-alist (alist-get inst-id my-inst-column-decimal-cycles)))
-                                (unless (member raw-dec (alist-get idx inst-alist))
-                                  (push raw-dec (alist-get idx inst-alist))
+                                (unless (member dec (alist-get idx inst-alist))
+                                  (push dec (alist-get idx inst-alist))
                                   (setf (alist-get inst-id my-inst-column-decimal-cycles) inst-alist))))))))))
       (forward-line 1)))
 
     ;; 3. Sort Numerically
     (dolist (inst-cell my-inst-column-decimal-cycles)
       (dolist (col-cell (cdr inst-cell))
-        (setcdr col-cell (sort (cdr col-cell)
+        (setcdr col-cell (sort (delete-dups (cdr col-cell))
                                (lambda (a b)
                                  (< (string-to-number (concat "0." a))
                                     (string-to-number (concat "0." b))))))))
@@ -932,12 +961,20 @@ The original buffer is NEVER modified.  Any previous temp file is deleted."
            (inst-str (csound--extract-inst-id (nth 0 line-fields)))
            (inst-id (when inst-str (string-to-number inst-str)))
            (inst-dec-alist (alist-get inst-id my-inst-column-decimal-cycles))
-           (decimal-list (alist-get detected-idx inst-dec-alist))
+           (raw-decimal-list (alist-get detected-idx inst-dec-alist))
+           (decimal-list (when raw-decimal-list
+                           (sort (delete-dups
+                                  (mapcar (lambda (d) (if (= (length d) 1) (concat d "0") d))
+                                          raw-decimal-list))
+                                 (lambda (a b) (< (string-to-number (concat "0." a))
+                                                 (string-to-number (concat "0." b)))))))
            (thing (thing-at-point 'symbol)))
       ;; Fixed Regex: Allows no-leading-zero decimals like .1825
-      (if (and thing decimal-list (string-match "^\\([-+]?[0-9]*\\)\\.\\([0-9]*\\)$" thing))
-          (let* ((int-part (match-string 1 thing))
-                 (cur-dec (match-string 2 thing))
+      (if (and thing decimal-list
+               (or (string-match "^\\([-+]?[0-9]+\\)\\(?:\\.\\([0-9]*\\)\\)?$" thing)
+                   (string-match "^\\([-+]?\\)\\.\\([0-9]+\\)$" thing)))
+          (let* ((int-part (or (match-string 1 thing) ""))
+                 (cur-dec (or (match-string 2 thing) ""))
                  (cur-dec-c (if (string= cur-dec "") "00" (if (= (length cur-dec) 1) (concat cur-dec "0") cur-dec)))
                  (pos (or (cl-position cur-dec-c decimal-list :test 'string=) -1))
                  (new-pos (mod (+ pos direction) (length decimal-list)))
@@ -945,7 +982,7 @@ The original buffer is NEVER modified.  Any previous temp file is deleted."
                  (bounds (bounds-of-thing-at-point 'symbol)))
             (when (and new-dec bounds)
               (delete-region (car bounds) (cdr bounds))
-              (insert (concat int-part "." new-dec))
+              (insert (concat (if (string-empty-p int-part) "0" int-part) "." new-dec))
               (when (fboundp 'csound-score-align) (csound-score-align))))
         (message "No decimal list for this column or not on a number.")))))
 
@@ -996,6 +1033,44 @@ LOCAL-ONLY   — 1 to force local, 0 to force global (current inst), 2 to force 
          (cur-val   (nth col-idx fields))
          (inst-str  (csound--extract-inst-id (nth 0 fields)))
          (inst-id   (when inst-str (string-to-number inst-str)))
+         (target-id (cond
+                     ((and inst-id (= inst-id 503) (>= col-idx 5))
+                      (let* ((raw-t (or (and (> (length fields) 4) (nth 4 fields)) ""))
+                             (tid (cond
+                                   ((and (not (string-empty-p raw-t))
+                                         (not (csound-is-macro-p raw-t))
+                                         (string-match "[0-9]+" raw-t))
+                                    (string-to-number (match-string 0 raw-t)))
+                                   (t
+                                    (truncate (csound--get-number-at-column 5))))))
+                        (if (> tid 0) tid nil)))
+                     ((and inst-id (= inst-id 505) (>= col-idx 9))
+                      (let* ((raw-t (or (and (> (length fields) 8) (nth 8 fields)) ""))
+                             (tid (cond
+                                   ((and (not (string-empty-p raw-t))
+                                         (not (csound-is-macro-p raw-t))
+                                         (string-match "[0-9]+" raw-t))
+                                    (string-to-number (match-string 0 raw-t)))
+                                   (t
+                                    (truncate (csound--get-number-at-column 9))))))
+                        (if (> tid 0) tid nil)))
+                     ((and inst-id (= inst-id 506) (>= col-idx 7))
+                      (let* ((raw-t (or (and (> (length fields) 6) (nth 6 fields)) ""))
+                             (tid (cond
+                                   ((and (not (string-empty-p raw-t))
+                                         (not (csound-is-macro-p raw-t))
+                                         (string-match "[0-9]+" raw-t))
+                                    (string-to-number (match-string 0 raw-t)))
+                                   (t
+                                    (truncate (csound--get-number-at-column 7))))))
+                        (if (> tid 0) tid nil)))
+                     (t nil)))
+         (effective-id (or target-id inst-id))
+         (effective-col (cond
+                         ((and target-id (= inst-id 503)) (- col-idx 2))
+                         ((and target-id (= inst-id 505)) (- col-idx 6))
+                         ((and target-id (= inst-id 506)) (- col-idx 4))
+                         (t col-idx)))
 
          ;; 1. Determine effective scope (argument overrides the toggle)
          (scope (cond ((eq local-only 1) 'local)
@@ -1033,10 +1108,21 @@ LOCAL-ONLY   — 1 to force local, 0 to force global (current inst), 2 to force 
 
               ;; SCOPE: GLOBAL (Current Instrument Only)
               (t
-               (let ((inst-alist (alist-get inst-id (if (= decimal-only 1)
-                                                        my-inst-column-decimal-cycles
-                                                      my-inst-column-cycles))))
-                 (alist-get col-idx inst-alist))))))
+               (let* ((source-alist (if (= decimal-only 1)
+                                        my-inst-column-decimal-cycles
+                                      my-inst-column-cycles))
+                      (inst-alist (alist-get effective-id source-alist)))
+                 (or (alist-get effective-col inst-alist)
+                     (alist-get col-idx (alist-get inst-id source-alist))))))))
+
+        ;; Clean and deduplicate target-list for decimal-only mode
+        (when (and target-list (= decimal-only 1))
+          (setq target-list
+                (sort (delete-dups
+                       (mapcar (lambda (d) (if (= (length d) 1) (concat d "0") d))
+                               target-list))
+                      (lambda (a b) (< (string-to-number (concat "0." a))
+                                      (string-to-number (concat "0." b)))))))
 
         (if (= decimal-only 0)
             ;; ── FULL-FIELD mode ────────────────────────────────────────────────
@@ -1059,21 +1145,36 @@ LOCAL-ONLY   — 1 to force local, 0 to force global (current inst), 2 to force 
                   (goto-char rbeg)
                   (insert new-val)
                   (when (fboundp 'csound-score-align) (csound-score-align))
-                  (message "[Inst %d | %s] p%d → %s" inst-id
+                  (message "[Inst %d%s | %s] p%d → %s" inst-id
+                           (if target-id (format " (i%d)" target-id) "")
                            (upcase (symbol-name scope))
                            (1+ col-idx) new-val))))
 
           ;; ── DECIMAL-ONLY mode ──────────────────────────────────────────────
-          (if (not (and cur-val target-list (string-match "^\\([-+]?[0-9]*\\)\\.\\([0-9]*\\)$" cur-val)))
+          (if (not (and cur-val target-list
+                        (or (string-match "^\\([-+]?[0-9]+\\)\\(?:\\.\\([0-9]*\\)\\)?$" cur-val)
+                            (string-match "^\\([-+]?\\)\\.\\([0-9]+\\)$" cur-val))))
               (message "No decimal data found for field %d." (1+ col-idx))
-            (let* ((int-part  (match-string 1 cur-val))
-                   (int-num   (string-to-number int-part))
-                   (cur-dec   (match-string 2 cur-val))
+            (let* ((int-part  (or (match-string 1 cur-val) ""))
+                   (int-num   (if (string-empty-p int-part) 0 (string-to-number int-part)))
+                   (cur-dec   (or (match-string 2 cur-val) ""))
                    (cur-dec-c (cond ((string= cur-dec "")  "00")
                                     ((= (length cur-dec) 1) (concat cur-dec "0"))
                                     (t cur-dec)))
                    (list-len  (length target-list))
-                   (pos       (or (cl-position cur-dec-c target-list :test #'string=) -1))
+                   (raw-pos   (cl-position cur-dec-c target-list :test #'string=))
+                   (pos       (if raw-pos
+                                  raw-pos
+                                (let ((cur-num (string-to-number (concat "0." cur-dec-c)))
+                                      (idx nil))
+                                  (dotimes (i list-len)
+                                    (when (and (not idx)
+                                               (< cur-num (string-to-number (concat "0." (nth i target-list)))))
+                                      (setq idx i)))
+                                  (cond
+                                   ((and idx (= idx 0)) (if (> direction 0) -1 0))
+                                   (idx (if (> direction 0) (1- idx) idx))
+                                   (t (if (> direction 0) (1- list-len) list-len))))))
                    (wrap-fwd  (and (= direction  1) (= pos (1- list-len))))
                    (wrap-bwd  (and (= direction -1) (= pos 0)))
                    (new-int   (+ int-num (cond (wrap-fwd  1) (wrap-bwd -1) (t 0))))
@@ -1091,15 +1192,16 @@ LOCAL-ONLY   — 1 to force local, 0 to force global (current inst), 2 to force 
               (when (and rbeg new-dec)
                 (delete-region rbeg rend)
                 (goto-char rbeg)
-                (let ((final-int-str (if (or wrap-fwd wrap-bwd)
+                (let ((final-int-str (if (or wrap-fwd wrap-bwd (string-empty-p int-part))
                                          (number-to-string new-int)
                                        int-part)))
                   (insert (concat final-int-str "." new-dec)))
                 (when (fboundp 'csound-score-align) (csound-score-align))
-                (message "[Inst %d | %s] p%d -> %s.%s%s" inst-id
+                (message "[Inst %d%s | %s] p%d -> %s.%s%s" inst-id
+                         (if target-id (format " (i%d)" target-id) "")
                          (upcase (symbol-name scope))
                          (1+ col-idx)
-                         (if (or wrap-fwd wrap-bwd) (number-to-string new-int) int-part)
+                         (if (or wrap-fwd wrap-bwd (string-empty-p int-part)) (number-to-string new-int) int-part)
                          new-dec
                          (cond (wrap-fwd " (carry +1)") (wrap-bwd " (borrow -1)") (t "")))))))))
 
@@ -1163,7 +1265,7 @@ Change this via M-x customize-group -> csound for a persistent save."
   :group 'csound)
 
 (defcustom csound-instrument-info-file
-  (expand-file-name "csound-instruments.el" user-emacs-directory)
+  (expand-file-name "csound-instruments.el" (csound--default-directory))
   "File path to save and load persistent Csound instrument definitions."
   :type 'file
   :set (lambda (symbol value)
@@ -1230,10 +1332,10 @@ Change this via M-x customize-group -> csound for a persistent save."
     ;; p-field cycle ;;
     (define-key map (kbd "&") (lambda () (interactive) (csound-cycle-column 2  1 0))) ; dur
     (define-key map (kbd "*") (lambda () (interactive) (csound-cycle-column 2 -1 0)))
-    (define-key map (kbd "@") (lambda () (interactive) (csound-cycle-column 4  1 1))) ; note global
-    (define-key map (kbd "=") (lambda () (interactive) (csound-cycle-column 4 -1 1)))
-    (define-key map (kbd "+") (lambda () (interactive) (csound-cycle-column 4  1 1 1))) ; note local
-    (define-key map (kbd "$") (lambda () (interactive) (csound-cycle-column 4 -1 1 1)))
+    (define-key map (kbd "@") (lambda () (interactive) (csound-cycle-column 6  1 1))) ; note global
+    (define-key map (kbd "=") (lambda () (interactive) (csound-cycle-column 6 -1 1)))
+    (define-key map (kbd "+") (lambda () (interactive) (csound-cycle-column 6  1 1 1))) ; note local
+    (define-key map (kbd "$") (lambda () (interactive) (csound-cycle-column 6 -1 1 1)))
 
     ;; Dynamic column cycling (Column Agnostic)
     ;; Full-field cycling (+1 / -1)
@@ -1285,10 +1387,10 @@ Change this via M-x customize-group -> csound for a persistent save."
 
     (define-key map (kbd "*") (lambda () (interactive) (csound-cycle-column 2  1 0))) ; dur
     (define-key map (kbd "&") (lambda () (interactive) (csound-cycle-column 2 -1 0)))
-    (define-key map (kbd "@") (lambda () (interactive) (csound-cycle-column 4  1 1))) ; note global
-    (define-key map (kbd "=") (lambda () (interactive) (csound-cycle-column 4 -1 1)))
-    (define-key map (kbd "+") (lambda () (interactive) (csound-cycle-column 4  1 1 1))) ; note local
-    (define-key map (kbd "$") (lambda () (interactive) (csound-cycle-column 4 -1 1 1)))
+    (define-key map (kbd "@") (lambda () (interactive) (csound-cycle-column 6  1 1))) ; note global
+    (define-key map (kbd "=") (lambda () (interactive) (csound-cycle-column 6 -1 1)))
+    (define-key map (kbd "+") (lambda () (interactive) (csound-cycle-column 6  1 1 1))) ; note local
+    (define-key map (kbd "$") (lambda () (interactive) (csound-cycle-column 6 -1 1 1)))
 
     ;; Dynamic column cycling (Column Agnostic)
     ;; Full-field cycling (+1 / -1)
@@ -1366,10 +1468,12 @@ Change this via M-x customize-group -> csound for a persistent save."
     (define-key map (kbd "C-<iso-lefttab>") 'csound-recalculate-starts)
 
     ;; Instruments shortcuts
-    (define-key map (kbd "C-c r") (lambda () (interactive) (insert "; bf0000's keyboard\n\n;12 STR DUR AMP NOTE KC1 KC2 VDEPTH STR VRATE END EDO REPEAT BASE")))
-    (define-key map (kbd "C-c g") (lambda () (interactive) (insert "; 00b100's lyre\n\n;9 STR DUR AMP NOTE PLK PICK REFL EDO REPEAT BASE")))
-    (define-key map (kbd "C-c b") (lambda () (interactive) (insert "; 3044eb's violin\n\n;11 STR DUR AMP NOTE PRES RAT STR VIBF END VAMP EDO REPEAT BASE")))
-    (define-key map (kbd "C-c y") (lambda () (interactive) (insert "; 9e9b00's vibraphone\n\n;10 STR DUR AMP NOTE HRD POS STR VIBF END EDO REPEAT BASE")))
+    (define-key map (kbd "C-c r") (lambda () (interactive) (insert "; bf0000's keyboard\n\n;12 STR DUR PAN SPREAD AMP NOTE KC1 KC2 VDEPTH STR VRATE END EDO REPEAT BASE")))
+    (define-key map (kbd "C-c g") (lambda () (interactive) (insert "; 00b100's lyre\n\n;9 STR DUR PAN SPREAD AMP NOTE PLK PICK REFL EDO REPEAT BASE")))
+    (define-key map (kbd "C-c b") (lambda () (interactive) (insert "; 3044eb's violin\n\n;11 STR DUR PAN SPREAD AMP NOTE PRES RAT STR VIBF END VAMP EDO REPEAT BASE")))
+    (define-key map (kbd "C-c y") (lambda () (interactive) (insert "; 9e9b00's vibraphone\n\n;10 STR DUR PAN SPREAD AMP NOTE HRD POS STR VIBF END EDO REPEAT BASE")))
+    (define-key map (kbd "C-c m") #'csound-instruments-menu)
+    (define-key map (kbd "C-c M") #'csound-insert-instrument)
 
     ;; Set the initial parent based on the user's saved customize option
     (let ((default-map (alist-get csound-active-layout csound-layouts-alist)))
@@ -1383,11 +1487,45 @@ Change this via M-x customize-group -> csound for a persistent save."
 (defvar-local csound-cycle-scope 'all
   "Current scope for `csound-cycle-column`. Can be 'global, 'local, or 'all.")
 
+(defface csound-column-info-face
+  '((t :inherit mode-line-emphasis :bold nil))
+  "Face for displaying Csound column information in the mode line."
+  :group 'csound)
+
+(defcustom csound-max-column-info-length 65
+  "Maximum character length for column description in the mode line.
+Longer descriptions are truncated with an ellipsis."
+  :type 'integer
+  :group 'csound)
+
+(defvar-local csound--mode-line-col-info nil
+  "Cached string of the current column's parameter info for the mode line.")
+
+(defvar-local csound--last-col-info-point nil)
+(defvar-local csound--last-col-info-tick nil)
+
+(defvar csound-column-mode-line-indicator
+  '(:eval (when (and (bound-and-true-p csound-mode)
+                     csound--mode-line-col-info
+                     (not (string-empty-p csound--mode-line-col-info)))
+            (propertize (format " [%s]" csound--mode-line-col-info)
+                        'face 'csound-column-info-face)))
+  "Mode-line element displaying the active Csound score column information.")
+(put 'csound-column-mode-line-indicator 'risky-local-variable t)
+
 ;; 2. Upgrade the lighter to check all 3 states
-(defvar csound-mode-lighter '(:eval (pcase csound-cycle-scope
-                                      ('local " cycle[L]")
-                                      ('all   " cycle[A]")
-                                      (_      " cycle[G]")))
+(defvar csound-mode-lighter
+  '(:eval (concat
+           (pcase csound-cycle-scope
+             ('local " cycle[L]")
+             ('all   " cycle[A]")
+             (_      " cycle[G]"))
+           (when (and (bound-and-true-p csound-mode)
+                      csound--mode-line-col-info
+                      (not (string-empty-p csound--mode-line-col-info))
+                      (not (member 'csound-column-mode-line-indicator mode-line-format)))
+             (propertize (format " [%s]" csound--mode-line-col-info)
+                         'face 'csound-column-info-face))))
   "Dynamic mode-line indicator for `csound-mode`.")
 (put 'csound-mode-lighter 'risky-local-variable t)
 
@@ -1490,39 +1628,217 @@ If definitions already exist in memory, populate the buffer with them."
                                    (csound-parse-instrument-info)
                                    (quit-window))))
 
-(defun csound-show-column-info ()
-  "Identify the instrument and column at point, and display its definition."
-  (interactive)
+(defun csound--extract-recommended-value (col-desc &optional col-idx)
+  "Extract the parameter name and recommended value from COL-DESC.
+COL-IDX is the 0-indexed column position (e.g. 0 for p1)."
+  (cond
+   ((null col-desc) nil)
+   ;; Column 0: instrument header (e.g. "i1062: harp (concert acoustic...)")
+   ((and col-idx (= col-idx 0)
+         (string-match "^\\([iI]?[0-9]+\\):\\s-*\\([^(:]+\\)" col-desc))
+    (format "%s (%s)" (match-string 1 col-desc) (string-trim (match-string 2 col-desc))))
+   ;; pan / spread normalization if range not already attached
+   ((string-match "^pan\\s-*:" col-desc) "pan(-1:1)")
+   ((string-match "^spread\\s-*:" col-desc) "spread(0:100)")
+   ;; Token before colon (e.g. "pluckpoint(0:1)", "ring(0.5:0.999)", "amp", "note")
+   ((string-match "^\\([^:(]+\\(?:([^)]*)\\)?[^:]*?\\)\\s-*:" col-desc)
+    (string-trim (match-string 1 col-desc)))
+   ;; Fallback
+   (t (string-trim col-desc))))
+
+(defun csound--truncate-info (str &optional max-len)
+  "Truncate STR to MAX-LEN characters (defaults to `csound-max-column-info-length`)."
+  (let ((limit (or max-len csound-max-column-info-length)))
+    (if (and str (> (length str) limit))
+        (concat (substring str 0 (- limit 3)) "...")
+      str)))
+
+(defun csound-get-column-info-at-point (&optional no-truncate)
+  "Identify instrument and column at point, returning formatted description string.
+When NO-TRUNCATE is non-nil, returns the full description without length cap."
   (let* ((line-beg (line-beginning-position))
+         (line-end (line-end-position))
          (orig-point (point))
-         (found-idx nil)
-         (line-text (buffer-substring-no-properties line-beg (line-end-position)))
-         (fields (csound-split-line line-text)))
+         (line-text (buffer-substring-no-properties line-beg line-end))
+         (trimmed-line (string-trim line-text)))
+    (unless (string-empty-p trimmed-line)
+      (let* ((is-ref-line (string-prefix-p ";" trimmed-line))
+             (inst-id nil)
+             (tokens '())
+             (scan 0)
+             (comment-pos (unless is-ref-line (string-match ";" line-text)))
+             (comment-beg (when comment-pos (+ line-beg comment-pos)))
+             (text-to-scan (if is-ref-line
+                               line-text
+                             (if comment-pos
+                                 (substring line-text 0 comment-pos)
+                               line-text))))
+        (unless (and comment-beg (>= orig-point comment-beg))
+          (while (string-match csound-field-regex text-to-scan scan)
+            (push (list :beg (+ line-beg (match-beginning 0))
+                        :end (+ line-beg (match-end 0))
+                        :str (match-string 0 text-to-scan))
+                  tokens)
+            (setq scan (match-end 0)))
+          (setq tokens (nreverse tokens))
+          (when tokens
+            (if is-ref-line
+                (when (string-match "^;\\s-*[iI]?\\s-*\\([0-9]+\\)" trimmed-line)
+                  (setq inst-id (string-to-number (match-string 1 trimmed-line))))
+              (let ((p1-str (plist-get (car tokens) :str)))
+                (cond
+                 ((and p1-str (string-match "^[iI]\\s-*\\([0-9]+\\)" p1-str))
+                  (setq inst-id (string-to-number (match-string 1 p1-str))))
+                 ((or (string-prefix-p "." p1-str) (string-equal p1-str "i."))
+                  (save-excursion
+                    (while (and (null inst-id) (= (forward-line -1) 0))
+                      (let ((prev (string-trim (buffer-substring-no-properties
+                                                (line-beginning-position) (line-end-position)))))
+                        (cond
+                         ((string-match "^[iI]\\s-*\\([0-9]+\\)" prev)
+                          (setq inst-id (string-to-number (match-string 1 prev))))
+                         ((string-match "^;\\s-*[iI]?\\s-*\\([0-9]+\\)" prev)
+                          (setq inst-id (string-to-number (match-string 1 prev)))))))))
+                 (t nil))))
+            (when (and inst-id (> inst-id 0))
+              (let ((found-idx 0))
+                (cond
+                 ;; Point is before the first token
+                 ((< orig-point (plist-get (car tokens) :beg))
+                  (setq found-idx 0))
+                 ;; Point is after the last token (in trailing whitespace)
+                 ((> orig-point (plist-get (car (last tokens)) :end))
+                  (setq found-idx (length tokens)))
+                 ;; Otherwise, point is within the tokens span
+                 (t
+                  (cl-loop for tok in tokens
+                           for i from 0
+                           for next-tok in (append (cdr tokens) '(nil))
+                           do
+                           (let ((b (plist-get tok :beg))
+                                 (e (plist-get tok :end)))
+                             (cond
+                              ((and (>= orig-point b) (<= orig-point e))
+                               (setq found-idx i)
+                               (cl-return))
+                              ((and next-tok (> orig-point e) (< orig-point (plist-get next-tok :beg)))
+                               (setq found-idx (1+ i))
+                               (cl-return)))))))
+                (let* ((fields (mapcar (lambda (tok) (plist-get tok :str)) tokens))
+                       (inst-info (alist-get inst-id csound-instrument-info-alist))
+                       (raw-result
+                        (cond
+                         ((and (= inst-id 503) (>= found-idx 5))
+                          (let* ((raw-target (or (and (> (length fields) 4) (nth 4 fields)) ""))
+                                 (target-id (cond
+                                             ((and (not (string-empty-p raw-target))
+                                                   (not (csound-is-macro-p raw-target))
+                                                   (string-match "[0-9]+" raw-target))
+                                              (string-to-number (match-string 0 raw-target)))
+                                             (t (truncate (csound--get-number-at-column 5)))))
+                                 (target-info (when (> target-id 0)
+                                                (alist-get target-id csound-instrument-info-alist)))
+                                 (target-col-idx (- found-idx 2))
+                                 (target-col-desc (when target-info (nth target-col-idx target-info))))
+                            (cond
+                             ((null target-col-desc)
+                              (if target-info
+                                  nil
+                                (format "p%d -> i%d p%d" (1+ found-idx) target-id (1+ target-col-idx))))
+                             (no-truncate
+                              (format "p%d -> i%d p%d: %s"
+                                      (1+ found-idx) target-id (1+ target-col-idx) target-col-desc))
+                             (t
+                              (let ((rec-val (csound--extract-recommended-value target-col-desc (1+ target-col-idx))))
+                                (format "p%d -> i%d p%d: %s"
+                                        (1+ found-idx) target-id (1+ target-col-idx) rec-val))))))
+                         ((and (= inst-id 505) (>= found-idx 9))
+                          (let* ((raw-target (or (and (> (length fields) 8) (nth 8 fields)) ""))
+                                 (target-id (cond
+                                             ((and (not (string-empty-p raw-target))
+                                                   (not (csound-is-macro-p raw-target))
+                                                   (string-match "[0-9]+" raw-target))
+                                              (string-to-number (match-string 0 raw-target)))
+                                             (t (truncate (csound--get-number-at-column 9)))))
+                                 (target-info (when (> target-id 0)
+                                                (alist-get target-id csound-instrument-info-alist)))
+                                 (target-col-idx (- found-idx 6))
+                                 (target-col-desc (when target-info (nth target-col-idx target-info))))
+                            (cond
+                             ((null target-col-desc)
+                              (if target-info
+                                  nil
+                                (format "p%d -> i%d p%d" (1+ found-idx) target-id (1+ target-col-idx))))
+                             (no-truncate
+                              (format "p%d -> i%d p%d: %s"
+                                      (1+ found-idx) target-id (1+ target-col-idx) target-col-desc))
+                             (t
+                              (let ((rec-val (csound--extract-recommended-value target-col-desc (1+ target-col-idx))))
+                                (format "p%d -> i%d p%d: %s"
+                                        (1+ found-idx) target-id (1+ target-col-idx) rec-val))))))
+                         ((and (= inst-id 506) (>= found-idx 7))
+                          (let* ((raw-target (or (and (> (length fields) 6) (nth 6 fields)) ""))
+                                 (target-id (cond
+                                             ((and (not (string-empty-p raw-target))
+                                                   (not (csound-is-macro-p raw-target))
+                                                   (string-match "[0-9]+" raw-target))
+                                              (string-to-number (match-string 0 raw-target)))
+                                             (t (truncate (csound--get-number-at-column 7)))))
+                                 (target-info (when (> target-id 0)
+                                                (alist-get target-id csound-instrument-info-alist)))
+                                 (target-col-idx (- found-idx 4))
+                                 (target-col-desc (when target-info (nth target-col-idx target-info))))
+                            (cond
+                             ((= target-id 0) (format "p%d: rest step" (1+ found-idx)))
+                             ((null target-col-desc)
+                              (if target-info
+                                  nil
+                                (format "p%d -> i%d p%d" (1+ found-idx) target-id (1+ target-col-idx))))
+                             (no-truncate
+                              (format "p%d -> i%d p%d: %s"
+                                      (1+ found-idx) target-id (1+ target-col-idx) target-col-desc))
+                             (t
+                              (let ((rec-val (csound--extract-recommended-value target-col-desc (1+ target-col-idx))))
+                                (format "p%d -> i%d p%d: %s"
+                                        (1+ found-idx) target-id (1+ target-col-idx) rec-val))))))
+                         (t
+                          (let ((col-desc (nth found-idx inst-info)))
+                            (cond
+                             ((null col-desc)
+                              nil)
+                             (no-truncate
+                              (cond
+                               ((and (= found-idx 0) col-desc)
+                                (format "p1: %s" col-desc))
+                               (t
+                                (format "p%d: %s" (1+ found-idx) col-desc))))
+                             (t
+                              (let ((rec-val (csound--extract-recommended-value col-desc found-idx)))
+                                (format "p%d: %s" (1+ found-idx) rec-val)))))))))
+                (when raw-result
+                  (if no-truncate raw-result (csound--truncate-info raw-result))))))))))))
 
-    ;; 1. Find which column index the cursor is currently inside
-    (save-excursion
-      (beginning-of-line)
-      (let ((start 0) (idx 0))
-        (while (string-match "\\[[^]]+\\]\\|\\S-+" line-text start)
-          (let ((m-beg (+ line-beg (match-beginning 0)))
-                (m-end (+ line-beg (match-end 0))))
-            (when (and (>= orig-point m-beg) (<= orig-point m-end))
-              (setq found-idx idx)))
-          (setq start (match-end 0) idx (1+ idx)))))
+(defun csound--update-column-info ()
+  "Update `csound--mode-line-col-info` if point or buffer changed."
+  (when (bound-and-true-p csound-mode)
+    (let ((cur-pt (point))
+          (cur-tick (buffer-chars-modified-tick)))
+      (unless (and (eq cur-pt csound--last-col-info-point)
+                   (eq cur-tick csound--last-col-info-tick))
+        (setq csound--last-col-info-point cur-pt
+              csound--last-col-info-tick cur-tick)
+        (let ((new-info (csound-get-column-info-at-point)))
+          (unless (equal new-info csound--mode-line-col-info)
+            (setq csound--mode-line-col-info new-info)
+            (force-mode-line-update)))))))
 
-    ;; Default to column 0 if we are somehow outside a token but on the line
-    (unless found-idx (setq found-idx 0))
-
-    ;; 2. Extract instrument ID and look it up
-    (let* ((inst-str (csound--extract-inst-id (nth 0 fields)))
-           (inst-id (when inst-str (string-to-number inst-str))))
-      (if (not inst-id)
-          (message "No instrument detected on this line.")
-        (let* ((inst-info (alist-get inst-id csound-instrument-info-alist))
-               (col-desc (nth found-idx inst-info)))
-          (if col-desc
-              (message "[Inst %d / Col %d]: %s" inst-id found-idx col-desc)
-            (message "[Inst %d / Col %d]: No definition provided." inst-id found-idx)))))))
+(defun csound-show-column-info ()
+  "Identify the instrument and column at point, and display its definition in the echo area."
+  (interactive)
+  (let ((info (csound-get-column-info-at-point t)))
+    (if info
+        (message "%s" info)
+      (message "No instrument / column definition detected at point."))))
 
 ;; --- MINOR MODE ---
 (define-minor-mode csound-mode
@@ -1535,11 +1851,16 @@ If definitions already exist in memory, populate the buffer with them."
         (modify-syntax-entry ?\. "w" (syntax-table))
         (visual-line-mode -1)
         (setq truncate-lines t)
-        (harvest-all-columns-to-cycle-list))
+        (harvest-all-columns-to-cycle-list)
+        (add-hook 'post-command-hook #'csound--update-column-info nil t)
+        (csound--update-column-info))
     (progn
       (modify-syntax-entry ?\. "." (syntax-table))
       (visual-line-mode 1)
-      (setq truncate-lines nil))))
+      (setq truncate-lines nil)
+      (remove-hook 'post-command-hook #'csound--update-column-info t)
+      (setq csound--mode-line-col-info nil)
+      (force-mode-line-update))))
 
 ;; 3. FAILSAFE: Forcefully update Emacs' internal alist for the active session
 (let ((cell (assq 'csound-mode minor-mode-alist)))
@@ -1578,13 +1899,31 @@ If definitions already exist in memory, populate the buffer with them."
 (define-derived-mode csound-score-mode text-mode "Csound Score"
   "Major mode for editing Csound files, triggering csound-mode automatically."
   (csound-mode 1)         ; Activate your custom minor mode
-  (setq line-spacing -1)) ; Apply your tight line spacing
+  (setq line-spacing -1)  ; Apply your tight line spacing
+  (unless (member 'csound-column-mode-line-indicator mode-line-format)
+    (let ((pos (or (cl-position 'mode-line-modes mode-line-format)
+                   (cl-position '(which-function-mode ("" which-func-format " ")) mode-line-format))))
+      (if pos
+          (setq-local mode-line-format
+                      (append (cl-subseq mode-line-format 0 (1+ pos))
+                              (list 'csound-column-mode-line-indicator)
+                              (cl-subseq mode-line-format (1+ pos))))
+        (setq-local mode-line-format
+                    (append mode-line-format (list 'csound-column-mode-line-indicator)))))))
 
 ;; Associate .sco files with this new major mode
 (add-to-list 'auto-mode-alist '("\\.sco\\'" . csound-score-mode))
 
 ;; Load saved instrument definitions when the package initializes
 (csound-load-instrument-info)
+
+;; Add Csound directory to load-path so csound-instruments-menu can always be found
+(let ((csound-dir (file-name-directory csound-header-path)))
+  (when (and csound-dir (file-directory-p csound-dir))
+    (add-to-list 'load-path (directory-file-name (expand-file-name csound-dir)))))
+
+;; Load interactive instruments menu if available
+(require 'csound-instruments-menu nil t)
 
 (provide 'csound-score)
 ;;; csound-score.el ends here
